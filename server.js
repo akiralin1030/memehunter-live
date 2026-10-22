@@ -2,30 +2,31 @@ const http = require("http");
 
 const PORT = process.env.PORT || 10000;
 
+const START_BALANCE = 10000;
+const CACHE_MS = 60000;
+
 let marketCache = {
   time: 0,
   data: null
 };
 
-const CACHE_MS = 60 * 1000;
-
-// ==============================
-// DEX SCREENER MARKET DATA
-// ==============================
+// ============================================================
+// DEX SCREENER
+// ============================================================
 
 async function fetchJson(url) {
-  const r = await fetch(url, {
+  const response = await fetch(url, {
     headers: {
       Accept: "application/json",
       "User-Agent": "MemeHunter-Paper-Trader/1.0"
     }
   });
 
-  if (!r.ok) {
-    throw new Error(`DEX Screener HTTP ${r.status}`);
+  if (!response.ok) {
+    throw new Error("DEX Screener HTTP " + response.status);
   }
 
-  return r.json();
+  return response.json();
 }
 
 async function getMarketData() {
@@ -36,110 +37,210 @@ async function getMarketData() {
     return marketCache.data;
   }
 
-  const [profiles, boosts] = await Promise.all([
+  // 找近期正在被關注的 Solana token
+  const results = await Promise.allSettled([
     fetchJson(
       "https://api.dexscreener.com/token-profiles/latest/v1"
+    ),
+    fetchJson(
+      "https://api.dexscreener.com/token-boosts/latest/v1"
     ),
     fetchJson(
       "https://api.dexscreener.com/token-boosts/top/v1"
     )
   ]);
 
+  let discovery = [];
+
+  for (const result of results) {
+    if (
+      result.status === "fulfilled" &&
+      Array.isArray(result.value)
+    ) {
+      discovery.push(...result.value);
+    }
+  }
+
   const addresses = [
     ...new Set(
-      [...(profiles || []), ...(boosts || [])]
-        .filter(x => x.chainId === "solana")
-        .map(x => x.tokenAddress)
-        .filter(Boolean)
+      discovery
+        .filter(function (item) {
+          return (
+            item &&
+            item.chainId === "solana" &&
+            item.tokenAddress
+          );
+        })
+        .map(function (item) {
+          return item.tokenAddress;
+        })
     )
-  ].slice(0, 60);
+  ].slice(0, 90);
+
+  if (!addresses.length) {
+    throw new Error("No Solana tokens discovered");
+  }
 
   let rawPairs = [];
 
+  // DEX Screener tokens API 每次最多抓一批
   for (let i = 0; i < addresses.length; i += 30) {
     const batch = addresses.slice(i, i + 30);
 
     try {
       const data = await fetchJson(
         "https://api.dexscreener.com/tokens/v1/solana/" +
-        batch.join(",")
+          batch.join(",")
       );
 
       if (Array.isArray(data)) {
         rawPairs.push(...data);
       }
-    } catch (e) {
-      console.log("DEX batch error:", e.message);
+    } catch (error) {
+      console.log(
+        "DEX batch failed:",
+        error.message
+      );
     }
   }
 
-  // 每個 token 只留流動性最大的交易池
-  const best = new Map();
+  if (!rawPairs.length) {
+    throw new Error("No market pairs returned");
+  }
 
-  for (const p of rawPairs) {
-    if (
-      p.chainId !== "solana" ||
-      !p.baseToken?.address ||
-      !p.priceUsd
-    ) {
-      continue;
-    }
+  // 同一 Token 有多個池時，只保留流動性最大的池
+  const bestPairs = new Map();
 
-    const address = p.baseToken.address;
-    const old = best.get(address);
+  for (const pair of rawPairs) {
+    if (!pair) continue;
+    if (pair.chainId !== "solana") continue;
+    if (!pair.baseToken) continue;
+    if (!pair.baseToken.address) continue;
+    if (!pair.priceUsd) continue;
 
-    if (
-      !old ||
-      Number(p.liquidity?.usd || 0) >
-      Number(old.liquidity?.usd || 0)
-    ) {
-      best.set(address, p);
+    const address = pair.baseToken.address;
+
+    const old = bestPairs.get(address);
+
+    const liquidity =
+      Number(
+        pair.liquidity &&
+          pair.liquidity.usd
+          ? pair.liquidity.usd
+          : 0
+      ) || 0;
+
+    const oldLiquidity =
+      old
+        ? Number(
+            old.liquidity &&
+              old.liquidity.usd
+              ? old.liquidity.usd
+              : 0
+          ) || 0
+        : 0;
+
+    if (!old || liquidity > oldLiquidity) {
+      bestPairs.set(address, pair);
     }
   }
 
-  const rows = [...best.values()].map(p => ({
-    address: p.baseToken.address,
-    pairAddress: p.pairAddress,
+  const rows = [];
 
-    symbol:
-      p.baseToken?.symbol || "?",
+  for (const pair of bestPairs.values()) {
+    const base = pair.baseToken || {};
 
-    name:
-      p.baseToken?.name ||
-      p.baseToken?.symbol ||
-      "?",
+    rows.push({
+      address: base.address || "",
+      pairAddress: pair.pairAddress || "",
 
-    price:
-      Number(p.priceUsd || 0),
+      symbol:
+        base.symbol || "?",
 
-    liquidity:
-      Number(p.liquidity?.usd || 0),
+      name:
+        base.name ||
+        base.symbol ||
+        "?",
 
-    volume5m:
-      Number(p.volume?.m5 || 0),
+      price:
+        Number(pair.priceUsd || 0),
 
-    volume1h:
-      Number(p.volume?.h1 || 0),
+      liquidity:
+        Number(
+          pair.liquidity &&
+            pair.liquidity.usd
+            ? pair.liquidity.usd
+            : 0
+        ),
 
-    buys5m:
-      Number(p.txns?.m5?.buys || 0),
+      volume5m:
+        Number(
+          pair.volume &&
+            pair.volume.m5
+            ? pair.volume.m5
+            : 0
+        ),
 
-    sells5m:
-      Number(p.txns?.m5?.sells || 0),
+      volume1h:
+        Number(
+          pair.volume &&
+            pair.volume.h1
+            ? pair.volume.h1
+            : 0
+        ),
 
-    price5m:
-      Number(p.priceChange?.m5 || 0),
+      buys5m:
+        Number(
+          pair.txns &&
+            pair.txns.m5 &&
+            pair.txns.m5.buys
+            ? pair.txns.m5.buys
+            : 0
+        ),
 
-    price1h:
-      Number(p.priceChange?.h1 || 0),
+      sells5m:
+        Number(
+          pair.txns &&
+            pair.txns.m5 &&
+            pair.txns.m5.sells
+            ? pair.txns.m5.sells
+            : 0
+        ),
 
-    createdAt:
-      Number(p.pairCreatedAt || Date.now()),
+      price5m:
+        Number(
+          pair.priceChange &&
+            pair.priceChange.m5
+            ? pair.priceChange.m5
+            : 0
+        ),
 
-    url:
-      p.url ||
-      `https://dexscreener.com/solana/${p.pairAddress}`
-  }));
+      price1h:
+        Number(
+          pair.priceChange &&
+            pair.priceChange.h1
+            ? pair.priceChange.h1
+            : 0
+        ),
+
+      createdAt:
+        Number(
+          pair.pairCreatedAt ||
+            Date.now()
+        ),
+
+      url:
+        pair.url ||
+        (
+          "https://dexscreener.com/solana/" +
+          pair.pairAddress
+        )
+    });
+  }
+
+  rows.sort(function (a, b) {
+    return b.liquidity - a.liquidity;
+  });
 
   marketCache = {
     time: Date.now(),
@@ -149,16 +250,17 @@ async function getMarketData() {
   return rows;
 }
 
-// ==============================
-// FRONTEND
-// ==============================
+// ============================================================
+// HTML
+// ============================================================
 
-const PAGE = String.raw`
+const PAGE = `
 <!doctype html>
 <html lang="zh-Hant">
 
 <head>
 <meta charset="utf-8">
+
 <meta
   name="viewport"
   content="width=device-width,initial-scale=1"
@@ -168,225 +270,229 @@ const PAGE = String.raw`
 
 <style>
 
-*{
-  box-sizing:border-box
+* {
+  box-sizing: border-box;
 }
 
-body{
-  margin:0;
-  background:#080b0e;
-  color:#edf3f7;
+body {
+  margin: 0;
+  background: #080b0e;
+  color: #edf3f7;
   font-family:
     system-ui,
     -apple-system,
     "Segoe UI",
     "Noto Sans TC",
-    sans-serif
+    sans-serif;
 }
 
-.wrap{
-  max-width:1450px;
-  margin:auto;
-  padding:18px
+.wrap {
+  max-width: 1500px;
+  margin: auto;
+  padding: 18px;
 }
 
-.top{
-  display:flex;
-  gap:12px;
-  align-items:center;
-  flex-wrap:wrap
+.top {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
 }
 
-h1{
-  margin:0;
-  font-size:23px
+h1 {
+  margin: 0;
+  font-size: 23px;
 }
 
-.badge{
-  color:#31e986;
-  border:1px solid #17643d;
-  background:#0b2518;
-  padding:5px 9px;
-  border-radius:99px;
-  font-size:11px
+.spacer {
+  flex: 1;
 }
 
-.status{
-  color:#31e986
+.badge {
+  color: #31e986;
+  border: 1px solid #17643d;
+  background: #0b2518;
+  padding: 5px 9px;
+  border-radius: 999px;
+  font-size: 11px;
 }
 
-button{
-  padding:9px 14px;
-  border-radius:8px;
-  border:1px solid #33404a;
-  background:#162029;
-  color:#fff;
-  cursor:pointer
+.status {
+  color: #31e986;
 }
 
-button:hover{
-  border-color:#60717e
+button {
+  padding: 9px 14px;
+  border-radius: 8px;
+  border: 1px solid #33404a;
+  background: #162029;
+  color: #ffffff;
+  cursor: pointer;
 }
 
-.note{
-  margin-top:14px;
-  background:#0f151b;
-  border:1px solid #27323b;
-  border-radius:9px;
-  padding:11px 13px;
-  color:#9cabb7;
-  font-size:12px
+button:hover {
+  border-color: #60717e;
 }
 
-.error{
-  display:none;
-  margin-top:12px;
-  background:#2b1116;
-  border:1px solid #6d3038;
-  color:#ff98a3;
-  padding:11px;
-  border-radius:8px
+.note {
+  margin-top: 14px;
+  background: #0f151b;
+  border: 1px solid #27323b;
+  border-radius: 9px;
+  padding: 11px 13px;
+  color: #9cabb7;
+  font-size: 12px;
 }
 
-.grid{
-  display:grid;
-  gap:12px
+.error {
+  display: none;
+  margin-top: 12px;
+  background: #2b1116;
+  border: 1px solid #6d3038;
+  color: #ff98a3;
+  padding: 11px;
+  border-radius: 8px;
 }
 
-.kpis{
+.grid {
+  display: grid;
+  gap: 12px;
+}
+
+.kpis {
   grid-template-columns:
-    repeat(8,minmax(120px,1fr));
-  margin-top:14px
+    repeat(8, minmax(120px, 1fr));
+  margin-top: 14px;
 }
 
-.card{
-  background:#10161c;
-  border:1px solid #26313a;
-  border-radius:10px;
-  padding:14px
+.card,
+.panel {
+  background: #10161c;
+  border: 1px solid #26313a;
+  border-radius: 10px;
 }
 
-.label{
-  color:#8ca0af;
-  font-size:11px
+.card {
+  padding: 14px;
 }
 
-.value{
-  margin-top:5px;
-  font-size:21px;
-  font-weight:800
+.panel {
+  margin-top: 14px;
+  padding: 14px;
 }
 
-.green{
-  color:#31e986
+.label {
+  color: #8ca0af;
+  font-size: 11px;
 }
 
-.red{
-  color:#ff6877
+.value {
+  margin-top: 5px;
+  font-size: 21px;
+  font-weight: 800;
 }
 
-.yellow{
-  color:#f2bc59
+.green {
+  color: #31e986;
 }
 
-.panel{
-  margin-top:14px;
-  background:#10161c;
-  border:1px solid #26313a;
-  border-radius:10px;
-  padding:14px
+.red {
+  color: #ff6877;
 }
 
-.panel-title{
-  display:flex;
-  justify-content:space-between;
-  align-items:center;
-  gap:10px
+.yellow {
+  color: #f2bc59;
 }
 
-.panel-title h2{
-  margin:0;
-  font-size:16px
+.panel-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
 }
 
-.small{
-  font-size:11px;
-  color:#8999a6
+.panel-title h2 {
+  margin: 0;
+  font-size: 16px;
 }
 
-table{
-  width:100%;
-  border-collapse:collapse;
-  font-size:12px
+.small {
+  font-size: 11px;
+  color: #8999a6;
+}
+
+.two {
+  grid-template-columns: 1.3fr 0.7fr;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.stat {
+  padding: 10px;
+  background: #141c23;
+  border-radius: 7px;
+}
+
+.stat b {
+  float: right;
+}
+
+.scroll {
+  overflow: auto;
+  max-height: 470px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
 }
 
 th,
-td{
-  text-align:left;
-  padding:9px;
-  border-bottom:1px solid #202a32;
-  white-space:nowrap
+td {
+  text-align: left;
+  padding: 9px;
+  border-bottom: 1px solid #202a32;
+  white-space: nowrap;
 }
 
-th{
-  color:#8ca0af
+th {
+  color: #8ca0af;
 }
 
-.scroll{
-  overflow:auto;
-  max-height:470px
+a {
+  color: #8fcaff;
+  text-decoration: none;
 }
 
-a{
-  color:#8fcaff;
-  text-decoration:none
+canvas {
+  width: 100%;
+  height: 170px;
+  background: #0a0f13;
+  border-radius: 7px;
 }
 
-.two{
-  grid-template-columns:1.3fr .7fr
-}
+@media(max-width:1100px) {
 
-.stats{
-  display:grid;
-  grid-template-columns:1fr 1fr;
-  gap:8px
-}
-
-.stat{
-  padding:10px;
-  background:#141c23;
-  border-radius:7px
-}
-
-.stat b{
-  float:right
-}
-
-canvas{
-  width:100%;
-  height:170px;
-  background:#0a0f13;
-  border-radius:7px
-}
-
-@media(max-width:1100px){
-
-  .kpis{
-    grid-template-columns:repeat(4,1fr)
+  .kpis {
+    grid-template-columns: repeat(4, 1fr);
   }
 
-  .two{
-    grid-template-columns:1fr
+  .two {
+    grid-template-columns: 1fr;
   }
-
 }
 
-@media(max-width:650px){
+@media(max-width:650px) {
 
-  .kpis{
-    grid-template-columns:repeat(2,1fr)
+  .kpis {
+    grid-template-columns: repeat(2, 1fr);
   }
-
 }
 
 </style>
@@ -408,7 +514,7 @@ LIVE DATA • PAPER MONEY
 DEX Screener
 </span>
 
-<div style="flex:1"></div>
+<div class="spacer"></div>
 
 <span
   id="status"
@@ -417,22 +523,26 @@ DEX Screener
 ● RUNNING
 </span>
 
-<button onclick="scan()">
+<button
+  id="scanBtn"
+  type="button"
+>
 Scan Now
 </button>
 
-<button onclick="resetAccount()">
+<button
+  id="resetBtn"
+  type="button"
+>
 Reset 10,000U
 </button>
 
 </div>
 
 <div class="note">
-10,000U 模擬資金，
-使用真實 Solana DEX 行情進行 paper trading。
-不連接錢包、不使用真錢。
-資料由 Render 後端抓取，
-所以不會有本機 HTML 的 CORS 問題。
+真實 Solana DEX 行情＋10,000U 模擬資金。
+網站後端負責抓取 DEX Screener 行情。
+只做 paper trading，不連錢包、不下真單。
 </div>
 
 <div
@@ -444,80 +554,56 @@ Reset 10,000U
 
 <div class="card">
 <div class="label">EQUITY</div>
-<div
-  id="equity"
-  class="value"
->
+<div id="equity" class="value">
 10,000.00 U
 </div>
 </div>
 
 <div class="card">
 <div class="label">CASH</div>
-<div
-  id="cash"
-  class="value"
->
+<div id="cash" class="value">
 10,000.00 U
 </div>
 </div>
 
 <div class="card">
 <div class="label">TOTAL PNL</div>
-<div
-  id="totalPnl"
-  class="value"
->
+<div id="totalPnl" class="value">
 0.00 U
 </div>
 </div>
 
 <div class="card">
 <div class="label">REALIZED</div>
-<div
-  id="realized"
-  class="value"
->
+<div id="realized" class="value">
 0.00 U
 </div>
 </div>
 
 <div class="card">
 <div class="label">UNREALIZED</div>
-<div
-  id="unrealized"
-  class="value"
->
+<div id="unrealized" class="value">
 0.00 U
 </div>
 </div>
 
 <div class="card">
 <div class="label">WIN RATE</div>
-<div
-  id="winRate"
-  class="value"
->
+<div id="winRate" class="value">
 —
 </div>
 </div>
 
 <div class="card">
 <div class="label">MAX DRAWDOWN</div>
-<div
-  id="maxDd"
-  class="value"
->
+<div id="maxDd" class="value">
 0.0%
 </div>
 </div>
 
 <div class="card">
 <div class="label">OPEN POSITIONS</div>
-<div
-  id="openCount"
-  class="value"
->
+<div id="openCount" class="value">
 0
 </div>
 </div>
@@ -629,25 +715,15 @@ Live Hunter Feed
 <tr>
 
 <th>Token</th>
-
 <th>Age</th>
-
 <th>Price</th>
-
 <th>Liquidity</th>
-
 <th>Vol 5m</th>
-
 <th>Vol 1h</th>
-
 <th>5m B/S</th>
-
 <th>5m %</th>
-
 <th>1h %</th>
-
 <th>Score</th>
-
 <th>Decision</th>
 
 </tr>
@@ -687,15 +763,10 @@ Live Hunter Feed
 <tr>
 
 <th>Token</th>
-
 <th>Entry</th>
-
 <th>Now</th>
-
 <th>Value</th>
-
 <th>PnL</th>
-
 <th>Age</th>
 
 </tr>
@@ -719,48 +790,31 @@ Live Hunter Feed
 </h2>
 
 <span class="small">
-Balanced v1
+Balanced v2
 </span>
 
 </div>
 
 <div
   class="small"
-  style="line-height:1.8"
+  style="line-height:1.9"
 >
 
-起始 10,000U<br>
-
-單筆 5% Equity，
-最高 600U<br>
-
-最多同時 4 倉<br>
-
-總曝險上限 20%<br>
-
-流動性至少 50k<br>
-
-1h Volume 至少 15k<br>
-
-Score ≥ 68<br>
-
-5m 買賣比 ≥ 1.15<br>
-
-防追高：
-5m > 40% 或 1h > 150% 不買<br>
-
-硬停損 -10%<br>
-
-TP1 +15% 出 40%<br>
-
-TP2 +30% 出剩餘部位 50%<br>
-
-TP1 後使用 10% trailing stop<br>
-
-120 分鐘 time stop<br>
-
-模擬交易成本：
-進出各 0.5%
+起始資金：10,000U<br>
+單筆倉位：Equity 5%，最高 600U<br>
+最多持倉：4<br>
+總曝險：20%<br>
+最低流動性：50k<br>
+最低 1h Volume：15k<br>
+最低 Score：68<br>
+5m Buy/Sell ≥ 1.15<br>
+防追高：5m > 40% 或 1h > 150% 不進場<br>
+硬停損：-10%<br>
+TP1：+15% 出 40%<br>
+TP2：+30% 再出 50% 剩餘部位<br>
+TP1 後：10% trailing stop<br>
+Time Stop：120 分鐘<br>
+模擬成本：進場 0.5% / 出場 0.5%
 
 </div>
 
@@ -791,17 +845,11 @@ TP1 後使用 10% trailing stop<br>
 <tr>
 
 <th>Time</th>
-
 <th>Token</th>
-
 <th>Action</th>
-
 <th>Price</th>
-
 <th>Amount</th>
-
 <th>PnL</th>
-
 <th>Reason</th>
 
 </tr>
@@ -820,1486 +868,1744 @@ TP1 後使用 10% trailing stop<br>
 
 <script>
 
-const KEY =
-  "memehunter_live_dex_v1";
+(function () {
 
-const START_BALANCE =
-  10000;
+  "use strict";
 
-const SCAN_MS =
-  65000;
+  var KEY =
+    "memehunter_live_v2";
 
-let universe = [];
+  var SCAN_MS =
+    65000;
 
-let nextScanAt =
-  Date.now() + 2000;
+  var START_BALANCE =
+    ${START_BALANCE};
 
-let scanning =
-  false;
+  var universe = [];
 
-function freshState(){
+  var scanning =
+    false;
 
-  return {
-    cash:10000,
+  var nextScanAt =
+    Date.now() + 3000;
 
-    realized:0,
+  function byId(id) {
+    return document.getElementById(id);
+  }
 
-    fees:0,
+  function freshState() {
+    return {
+      cash: 10000,
+      realized: 0,
+      fees: 0,
+      positions: {},
+      trades: [],
+      cooldowns: {},
+      equityHistory: [
+        {
+          time: Date.now(),
+          equity: 10000
+        }
+      ]
+    };
+  }
 
-    positions:{},
+  var state;
 
-    trades:[],
+  try {
 
-    cooldowns:{},
+    state =
+      JSON.parse(
+        localStorage.getItem(KEY)
+      ) ||
+      freshState();
 
-    equityHistory:[
-      {
-        time:Date.now(),
-        equity:10000
-      }
-    ]
-  };
+  } catch (error) {
 
-}
+    state =
+      freshState();
 
-let state;
+  }
 
-try{
+  function save() {
 
-  state =
-    JSON.parse(
-      localStorage.getItem(KEY)
-    ) || freshState();
+    localStorage.setItem(
+      KEY,
+      JSON.stringify(state)
+    );
 
-}catch{
+  }
 
-  state =
-    freshState();
+  function money(value) {
 
-}
-
-function save(){
-
-  localStorage.setItem(
-    KEY,
-    JSON.stringify(state)
-  );
-
-}
-
-function money(v){
-
-  return Number(v || 0)
-    .toLocaleString(
+    return Number(
+      value || 0
+    ).toLocaleString(
       undefined,
       {
-        minimumFractionDigits:2,
-        maximumFractionDigits:2
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
       }
     );
 
-}
-
-function price(v){
-
-  v = Number(v || 0);
-
-  if(!v){
-    return "—";
   }
 
-  if(v >= 1){
+  function formatPrice(value) {
+
+    var number =
+      Number(value || 0);
+
+    if (!number) {
+      return "—";
+    }
+
+    if (number >= 1) {
+      return "$" +
+        number.toFixed(4);
+    }
+
     return "$" +
-      v.toFixed(4);
-  }
-
-  return "$" +
-    v.toPrecision(5);
-
-}
-
-function color(v){
-
-  if(v > 0){
-    return "green";
-  }
-
-  if(v < 0){
-    return "red";
-  }
-
-  return "";
-
-}
-
-function age(t){
-
-  const seconds =
-    Math.max(
-      0,
-      (Date.now() - t) / 1000
-    );
-
-  if(seconds < 3600){
-
-    return Math.floor(
-      seconds / 60
-    ) + "m";
+      number.toPrecision(5);
 
   }
 
-  if(seconds < 86400){
+  function color(value) {
+
+    if (value > 0) {
+      return "green";
+    }
+
+    if (value < 0) {
+      return "red";
+    }
+
+    return "";
+
+  }
+
+  function age(timestamp) {
+
+    var seconds =
+      Math.max(
+        0,
+        (
+          Date.now() -
+          timestamp
+        ) / 1000
+      );
+
+    if (seconds < 3600) {
+      return (
+        Math.floor(
+          seconds / 60
+        ) +
+        "m"
+      );
+    }
+
+    if (seconds < 86400) {
+      return (
+        (
+          seconds /
+          3600
+        ).toFixed(1) +
+        "h"
+      );
+    }
 
     return (
-      seconds / 3600
-    ).toFixed(1) + "h";
-
-  }
-
-  return (
-    seconds / 86400
-  ).toFixed(1) + "d";
-
-}
-
-function tokenScore(p){
-
-  let score = 0;
-
-  // Liquidity 25
-  score +=
-    Math.min(
-      25,
-      p.liquidity / 6000
-    );
-
-  // 1h volume 20
-  score +=
-    Math.min(
-      20,
-      p.volume1h / 8000
-    );
-
-  // recent activity 15
-  score +=
-    Math.min(
-      15,
-      (p.buys5m + p.sells5m) / 5
-    );
-
-  // buy pressure 15
-  const ratio =
-    p.buys5m /
-    Math.max(
-      1,
-      p.sells5m
-    );
-
-  score +=
-    Math.min(
-      15,
-      ratio * 7
-    );
-
-  // momentum 15
-  if(
-    p.price5m > 0 &&
-    p.price5m < 40
-  ){
-    score += 8;
-  }
-
-  if(
-    p.price1h > 0 &&
-    p.price1h < 150
-  ){
-    score += 7;
-  }
-
-  // age 10
-  const h =
-    (
-      Date.now() -
-      p.createdAt
-    ) /
-    3600000;
-
-  if(
-    h >= 0.25 &&
-    h <= 24
-  ){
-    score += 10;
-  }else if(h <= 72){
-    score += 6;
-  }
-
-  return Math.round(
-    Math.min(
-      100,
-      score
-    )
-  );
-
-}
-
-function evaluate(p){
-
-  const score =
-    tokenScore(p);
-
-  const reasons = [];
-
-  const pairMinutes =
-    (
-      Date.now() -
-      p.createdAt
-    ) /
-    60000;
-
-  if(
-    p.liquidity < 50000
-  ){
-    reasons.push(
-      "Liquidity < 50k"
-    );
-  }
-
-  if(
-    p.volume1h < 15000
-  ){
-    reasons.push(
-      "1h volume < 15k"
-    );
-  }
-
-  if(
-    p.buys5m +
-    p.sells5m <
-    15
-  ){
-    reasons.push(
-      "Low 5m activity"
-    );
-  }
-
-  if(pairMinutes < 5){
-
-    reasons.push(
-      "Too new"
+      (
+        seconds /
+        86400
+      ).toFixed(1) +
+      "d"
     );
 
   }
 
-  if(
-    p.price5m > 40 ||
-    p.price1h > 150
-  ){
+  function tokenScore(p) {
 
-    reasons.push(
-      "Anti-FOMO"
+    var score =
+      0;
+
+    score +=
+      Math.min(
+        25,
+        p.liquidity /
+        6000
+      );
+
+    score +=
+      Math.min(
+        20,
+        p.volume1h /
+        8000
+      );
+
+    score +=
+      Math.min(
+        15,
+        (
+          p.buys5m +
+          p.sells5m
+        ) /
+        5
+      );
+
+    var ratio =
+      p.buys5m /
+      Math.max(
+        1,
+        p.sells5m
+      );
+
+    score +=
+      Math.min(
+        15,
+        ratio * 7
+      );
+
+    if (
+      p.price5m > 0 &&
+      p.price5m < 40
+    ) {
+      score += 8;
+    }
+
+    if (
+      p.price1h > 0 &&
+      p.price1h < 150
+    ) {
+      score += 7;
+    }
+
+    var hours =
+      (
+        Date.now() -
+        p.createdAt
+      ) /
+      3600000;
+
+    if (
+      hours >= 0.25 &&
+      hours <= 24
+    ) {
+      score += 10;
+    } else if (
+      hours <= 72
+    ) {
+      score += 6;
+    }
+
+    return Math.round(
+      Math.min(
+        100,
+        score
+      )
     );
 
   }
 
-  if(score < 68){
+  function evaluate(p) {
 
-    reasons.push(
-      "Score < 68"
-    );
+    var score =
+      tokenScore(p);
 
-  }
+    var reasons =
+      [];
 
-  const ratio =
-    p.buys5m /
-    Math.max(
-      1,
-      p.sells5m
-    );
+    var pairMinutes =
+      (
+        Date.now() -
+        p.createdAt
+      ) /
+      60000;
 
-  if(ratio < 1.15){
+    if (
+      p.liquidity <
+      50000
+    ) {
+      reasons.push(
+        "Liquidity"
+      );
+    }
 
-    reasons.push(
-      "B/S < 1.15"
-    );
+    if (
+      p.volume1h <
+      15000
+    ) {
+      reasons.push(
+        "Volume"
+      );
+    }
 
-  }
+    if (
+      (
+        p.buys5m +
+        p.sells5m
+      ) <
+      15
+    ) {
+      reasons.push(
+        "Activity"
+      );
+    }
 
-  if(!reasons.length){
+    if (
+      pairMinutes <
+      5
+    ) {
+      reasons.push(
+        "TooNew"
+      );
+    }
+
+    if (
+      p.price5m >
+      40 ||
+      p.price1h >
+      150
+    ) {
+      reasons.push(
+        "FOMO"
+      );
+    }
+
+    if (
+      score <
+      68
+    ) {
+      reasons.push(
+        "Score"
+      );
+    }
+
+    var ratio =
+      p.buys5m /
+      Math.max(
+        1,
+        p.sells5m
+      );
+
+    if (
+      ratio <
+      1.15
+    ) {
+      reasons.push(
+        "BuySell"
+      );
+    }
+
+    if (!reasons.length) {
+      return {
+        score: score,
+        decision: "BUY"
+      };
+    }
+
+    var hardReject =
+      reasons.indexOf(
+        "Liquidity"
+      ) !== -1 ||
+      reasons.indexOf(
+        "Volume"
+      ) !== -1 ||
+      reasons.indexOf(
+        "Activity"
+      ) !== -1;
 
     return {
-      score,
-      decision:"BUY"
+      score: score,
+      decision:
+        hardReject
+          ? "REJECT"
+          : "WATCH"
     };
 
   }
 
-  const hard =
-    reasons.some(
-      x =>
-        x.includes("Liquidity") ||
-        x.includes("volume") ||
-        x.includes("activity")
-    );
+  function findToken(address) {
 
-  return {
-    score,
-    decision:
-      hard
-        ? "REJECT"
-        : "WATCH"
-  };
+    for (
+      var i = 0;
+      i < universe.length;
+      i++
+    ) {
 
-}
-
-function currentPrice(address){
-
-  const token =
-    universe.find(
-      x =>
-        x.address ===
+      if (
+        universe[i].address ===
         address
-    );
+      ) {
+        return universe[i];
+      }
+    }
 
-  return token?.price || 0;
-
-}
-
-function getEquity(){
-
-  let positionValue =
-    0;
-
-  let cost =
-    0;
-
-  for(
-    const p
-    of Object.values(
-      state.positions
-    )
-  ){
-
-    const px =
-      currentPrice(
-        p.address
-      ) ||
-      p.last ||
-      p.entry;
-
-    positionValue +=
-      p.qty * px;
-
-    cost +=
-      p.qty *
-      p.entry;
+    return null;
 
   }
 
-  return {
+  function currentPrice(address) {
 
-    equity:
-      state.cash +
-      positionValue,
+    var token =
+      findToken(address);
 
-    positionValue,
+    if (!token) {
+      return 0;
+    }
 
-    unrealized:
-      positionValue -
-      cost
-
-  };
-
-}
-
-function addTrade(
-  action,
-  p,
-  px,
-  amount,
-  pnl,
-  reason
-){
-
-  state.trades.unshift({
-
-    time:Date.now(),
-
-    symbol:p.symbol,
-
-    action,
-
-    price:px,
-
-    amount,
-
-    pnl,
-
-    reason
-
-  });
-
-  state.trades =
-    state.trades.slice(
-      0,
-      500
-    );
-
-}
-
-function closePosition(
-  pos,
-  fraction,
-  px,
-  reason
-){
-
-  const qty =
-    Math.min(
-      pos.qty,
-      pos.qty * fraction
-    );
-
-  const gross =
-    qty * px;
-
-  const fee =
-    gross * 0.005;
-
-  const proceeds =
-    gross - fee;
-
-  const basis =
-    qty * pos.entry;
-
-  const pnl =
-    proceeds -
-    basis;
-
-  state.cash +=
-    proceeds;
-
-  state.fees +=
-    fee;
-
-  state.realized +=
-    pnl;
-
-  pos.qty -=
-    qty;
-
-  addTrade(
-    "SELL",
-    pos,
-    px,
-    gross,
-    pnl,
-    reason
-  );
-
-  if(
-    pos.qty <
-    0.000000000001
-  ){
-
-    delete state.positions[
-      pos.address
-    ];
-
-    state.cooldowns[
-      pos.address
-    ] =
-      Date.now() +
-      6 * 3600000;
-
+    return token.price;
   }
 
-}
+  function getEquity() {
 
-function managePositions(){
+    var positionValue =
+      0;
 
-  for(
-    const pos
-    of Object.values({
-      ...state.positions
-    })
-  ){
+    var cost =
+      0;
 
-    const market =
-      universe.find(
-        x =>
-          x.address ===
-          pos.address
+    var keys =
+      Object.keys(
+        state.positions
       );
 
-    if(!market){
-      continue;
-    }
-
-    const px =
-      market.price;
-
-    pos.last =
-      px;
-
-    pos.high =
-      Math.max(
-        pos.high ||
-        pos.entry,
-        px
-      );
-
-    const ret =
-      px /
-      pos.entry -
-      1;
-
-    if(
-      ret <= -0.10
-    ){
-
-      closePosition(
-        pos,
-        1,
-        px,
-        "Hard stop -10%"
-      );
-
-      continue;
-
-    }
-
-    if(
-      market.liquidity <
-      pos.entryLiquidity *
-      0.65
-    ){
-
-      closePosition(
-        pos,
-        1,
-        px,
-        "Liquidity drop >35%"
-      );
-
-      continue;
-
-    }
-
-    if(
-      !pos.tp1 &&
-      ret >= 0.15
-    ){
-
-      closePosition(
-        pos,
-        0.40,
-        px,
-        "TP1 +15%"
-      );
-
-      pos.tp1 =
-        true;
-
-      continue;
-
-    }
-
-    if(
-      pos.tp1 &&
-      !pos.tp2 &&
-      ret >= 0.30
-    ){
-
-      closePosition(
-        pos,
-        0.50,
-        px,
-        "TP2 +30%"
-      );
-
-      pos.tp2 =
-        true;
-
-      continue;
-
-    }
-
-    if(
-      pos.tp1 &&
-      px <=
-      pos.high *
-      0.90
-    ){
-
-      closePosition(
-        pos,
-        1,
-        px,
-        "Trailing stop"
-      );
-
-      continue;
-
-    }
-
-    if(
-      !pos.tp1 &&
-      Date.now() -
-      pos.opened >
-      120 * 60000
-    ){
-
-      closePosition(
-        pos,
-        1,
-        px,
-        "120m time stop"
-      );
-
-    }
-
-  }
-
-}
-
-function enterPositions(){
-
-  const eq =
-    getEquity();
-
-  let slots =
-    4 -
-    Object.keys(
-      state.positions
-    ).length;
-
-  let room =
-    Math.max(
-      0,
-      eq.equity *
-      0.20 -
-      eq.positionValue
-    );
-
-  const picks =
-    universe
-      .map(
-        p => ({
-          p,
-          e:evaluate(p)
-        })
-      )
-      .filter(
-        x =>
-          x.e.decision ===
-          "BUY"
-      )
-      .sort(
-        (a,b) =>
-          b.e.score -
-          a.e.score
-      );
-
-  for(
-    const item
-    of picks
-  ){
-
-    if(
-      slots <= 0 ||
-      room < 50
-    ){
-      break;
-    }
-
-    const p =
-      item.p;
-
-    if(
-      state.positions[
-        p.address
-      ]
-    ){
-      continue;
-    }
-
-    if(
-      Date.now() <
-      (
-        state.cooldowns[
-          p.address
-        ] || 0
-      )
-    ){
-      continue;
-    }
-
-    const size =
-      Math.min(
-        eq.equity *
-        0.05,
-        600,
-        room,
-        state.cash /
-        1.005
-      );
-
-    if(size < 50){
-      continue;
-    }
-
-    const fee =
-      size *
-      0.005;
-
-    state.cash -=
-      size +
-      fee;
-
-    state.fees +=
-      fee;
-
-    const qty =
-      size /
-      p.price;
-
-    state.positions[
-      p.address
-    ] = {
-
-      address:
-        p.address,
-
-      symbol:
-        p.symbol,
-
-      entry:
-        p.price,
-
-      last:
-        p.price,
-
-      high:
-        p.price,
-
-      qty,
-
-      opened:
-        Date.now(),
-
-      entryLiquidity:
-        p.liquidity,
-
-      tp1:false,
-
-      tp2:false,
-
-      score:
-        item.e.score
-
-    };
-
-    addTrade(
-      "BUY",
-      state.positions[
-        p.address
-      ],
-      p.price,
-      size,
-      -fee,
-      "Score " +
-      item.e.score
-    );
-
-    slots--;
-
-    room -=
-      size;
-
-  }
-
-}
-
-function recordEquity(){
-
-  const e =
-    getEquity()
-      .equity;
-
-  const last =
-    state.equityHistory[
-      state.equityHistory.length -
-      1
-    ];
-
-  if(
-    !last ||
-    Math.abs(
-      last.equity - e
-    ) > 0.01 ||
-    Date.now() -
-    last.time >
-    300000
-  ){
-
-    state.equityHistory.push({
-
-      time:Date.now(),
-
-      equity:e
-
-    });
-
-  }
-
-  state.equityHistory =
-    state.equityHistory.slice(
-      -2000
-    );
-
-}
-
-function maxDrawdown(){
-
-  let peak =
-    0;
-
-  let max =
-    0;
-
-  for(
-    const p
-    of state.equityHistory
-  ){
-
-    peak =
-      Math.max(
-        peak,
-        p.equity
-      );
-
-    if(peak){
-
-      max =
-        Math.max(
-          max,
-          (
-            peak -
-            p.equity
-          ) /
-          peak
-        );
-
-    }
-
-  }
-
-  return max * 100;
-
-}
-
-async function scan(){
-
-  if(scanning){
-    return;
-  }
-
-  scanning =
-    true;
-
-  const error =
-    document.getElementById(
-      "error"
-    );
-
-  error.style.display =
-    "none";
-
-  try{
-
-    const r =
-      await fetch(
-        "/api/market",
-        {
-          cache:"no-store"
-        }
-      );
-
-    if(!r.ok){
-
-      throw new Error(
-        "HTTP " +
-        r.status
-      );
-
-    }
-
-    const data =
-      await r.json();
-
-    if(
-      !Array.isArray(data)
-    ){
-
-      throw new Error(
-        "Invalid market data"
-      );
-
-    }
-
-    universe =
-      data;
-
-    managePositions();
-
-    enterPositions();
-
-    recordEquity();
-
-    save();
-
-    render();
-
-    document.getElementById(
-      "lastScan"
-    ).textContent =
-      "Last scan " +
-      new Date()
-        .toLocaleTimeString();
-
-  }catch(e){
-
-    error.textContent =
-      "行情抓取失敗：" +
-      e.message;
-
-    error.style.display =
-      "block";
-
-  }finally{
-
-    scanning =
-      false;
-
-    nextScanAt =
-      Date.now() +
-      SCAN_MS;
-
-  }
-
-}
-
-function render(){
-
-  const eq =
-    getEquity();
-
-  const total =
-    eq.equity -
-    START_BALANCE;
-
-  const sells =
-    state.trades.filter(
-      x =>
-        x.action ===
-        "SELL"
-    );
-
-  const wins =
-    sells.filter(
-      x =>
-        x.pnl > 0
-    ).length;
-
-  document.getElementById(
-    "equity"
-  ).textContent =
-    money(
-      eq.equity
-    ) +
-    " U";
-
-  document.getElementById(
-    "cash"
-  ).textContent =
-    money(
-      state.cash
-    ) +
-    " U";
-
-  const pnlEl =
-    document.getElementById(
-      "totalPnl"
-    );
-
-  pnlEl.textContent =
-    (
-      total >= 0
-        ? "+"
-        : ""
-    ) +
-    money(total) +
-    " U";
-
-  pnlEl.className =
-    "value " +
-    color(total);
-
-  const real =
-    document.getElementById(
-      "realized"
-    );
-
-  real.textContent =
-    (
-      state.realized >= 0
-        ? "+"
-        : ""
-    ) +
-    money(
-      state.realized
-    ) +
-    " U";
-
-  real.className =
-    "value " +
-    color(
-      state.realized
-    );
-
-  const un =
-    document.getElementById(
-      "unrealized"
-    );
-
-  un.textContent =
-    (
-      eq.unrealized >= 0
-        ? "+"
-        : ""
-    ) +
-    money(
-      eq.unrealized
-    ) +
-    " U";
-
-  un.className =
-    "value " +
-    color(
-      eq.unrealized
-    );
-
-  document.getElementById(
-    "winRate"
-  ).textContent =
-    sells.length
-      ? (
-          wins /
-          sells.length *
-          100
-        ).toFixed(1) +
-        "%"
-      : "—";
-
-  document.getElementById(
-    "maxDd"
-  ).textContent =
-    maxDrawdown()
-      .toFixed(1) +
-    "%";
-
-  document.getElementById(
-    "openCount"
-  ).textContent =
-    Object.keys(
-      state.positions
-    ).length;
-
-  const evaluations =
-    universe.map(
-      p => ({
-        p,
-        e:evaluate(p)
-      })
-    );
-
-  document.getElementById(
-    "tokenCount"
-  ).textContent =
-    universe.length +
-    " tokens";
-
-  document.getElementById(
-    "candidateCount"
-  ).textContent =
-    evaluations.filter(
-      x =>
-        x.e.decision ===
-        "BUY"
-    ).length;
-
-  document.getElementById(
-    "bestScore"
-  ).textContent =
-    evaluations.length
-      ? Math.max(
-          ...evaluations.map(
-            x =>
-              x.e.score
-          )
-        )
-      : "—";
-
-  document.getElementById(
-    "tradeCount"
-  ).textContent =
-    state.trades.length;
-
-  document.getElementById(
-    "fees"
-  ).textContent =
-    money(
-      state.fees
-    ) +
-    " U";
-
-  document.getElementById(
-    "exposure"
-  ).textContent =
-    (
-      eq.positionValue /
-      Math.max(
-        1,
-        eq.equity
-      ) *
-      100
-    ).toFixed(1) +
-    "%";
-
-  const sorted =
-    evaluations
-      .sort(
-        (a,b) =>
-          b.e.score -
-          a.e.score
-      )
-      .slice(
-        0,
-        50
-      );
-
-  document.getElementById(
-    "feed"
-  ).innerHTML =
-    sorted.map(x => {
-
-      const p =
-        x.p;
-
-      const e =
-        x.e;
-
-      return \`
-
-      <tr>
-
-      <td>
-
-      <a
-        href="\${p.url}"
-        target="_blank"
-      >
-
-      <b>
-      \${p.symbol}
-      </b>
-
-      </a>
-
-      </td>
-
-      <td>
-      \${age(
-        p.createdAt
-      )}
-      </td>
-
-      <td>
-      \${price(
-        p.price
-      )}
-      </td>
-
-      <td>
-      $\${money(
-        p.liquidity /
-        1000
-      )}k
-      </td>
-
-      <td>
-      $\${money(
-        p.volume5m /
-        1000
-      )}k
-      </td>
-
-      <td>
-      $\${money(
-        p.volume1h /
-        1000
-      )}k
-      </td>
-
-      <td>
-      \${p.buys5m}/\${p.sells5m}
-      </td>
-
-      <td class="\${color(
-        p.price5m
-      )}">
-      \${p.price5m.toFixed(1)}%
-      </td>
-
-      <td class="\${color(
-        p.price1h
-      )}">
-      \${p.price1h.toFixed(1)}%
-      </td>
-
-      <td>
-      <b>
-      \${e.score}
-      </b>
-      </td>
-
-      <td class="\${
-        e.decision ===
-        "BUY"
-          ? "green"
-          : e.decision ===
-            "REJECT"
-          ? "red"
-          : "yellow"
-      }">
-
-      \${e.decision}
-
-      </td>
-
-      </tr>
-
-      \`;
-
-    }).join("");
-
-  document.getElementById(
-    "positions"
-  ).innerHTML =
-    Object.values(
-      state.positions
-    )
-    .map(p => {
-
-      const px =
+    for (
+      var i = 0;
+      i < keys.length;
+      i++
+    ) {
+
+      var p =
+        state.positions[
+          keys[i]
+        ];
+
+      var px =
         currentPrice(
           p.address
         ) ||
         p.last ||
         p.entry;
 
-      const value =
+      positionValue +=
         p.qty *
         px;
 
-      const pnl =
-        value -
+      cost +=
         p.qty *
         p.entry;
 
-      return \`
+    }
 
-      <tr>
+    return {
+      equity:
+        state.cash +
+        positionValue,
 
-      <td>
-      <b>\${p.symbol}</b>
-      </td>
+      positionValue:
+        positionValue,
 
-      <td>
-      \${price(p.entry)}
-      </td>
+      unrealized:
+        positionValue -
+        cost
+    };
 
-      <td>
-      \${price(px)}
-      </td>
+  }
 
-      <td>
-      \${money(value)} U
-      </td>
+  function addTrade(
+    action,
+    position,
+    px,
+    amount,
+    pnl,
+    reason
+  ) {
 
-      <td class="\${color(pnl)}">
-      \${pnl >= 0 ? "+" : ""}
-      \${money(pnl)} U
-      </td>
+    state.trades.unshift({
+      time:
+        Date.now(),
 
-      <td>
-      \${age(p.opened)}
-      </td>
+      symbol:
+        position.symbol,
 
-      </tr>
+      action:
+        action,
 
-      \`;
+      price:
+        px,
 
-    }).join("")
-    ||
-    \`
-    <tr>
-    <td colspan="6">
-    目前沒有持倉
-    </td>
-    </tr>
-    \`;
+      amount:
+        amount,
 
-  document.getElementById(
-    "trades"
-  ).innerHTML =
-    state.trades
-      .slice(
+      pnl:
+        pnl,
+
+      reason:
+        reason
+    });
+
+    if (
+      state.trades.length >
+      500
+    ) {
+      state.trades =
+        state.trades.slice(
+          0,
+          500
+        );
+    }
+
+  }
+
+  function closePosition(
+    position,
+    fraction,
+    px,
+    reason
+  ) {
+
+    var qty =
+      Math.min(
+        position.qty,
+        position.qty *
+        fraction
+      );
+
+    var gross =
+      qty *
+      px;
+
+    var fee =
+      gross *
+      0.005;
+
+    var proceeds =
+      gross -
+      fee;
+
+    var basis =
+      qty *
+      position.entry;
+
+    var pnl =
+      proceeds -
+      basis;
+
+    state.cash +=
+      proceeds;
+
+    state.fees +=
+      fee;
+
+    state.realized +=
+      pnl;
+
+    position.qty -=
+      qty;
+
+    addTrade(
+      "SELL",
+      position,
+      px,
+      gross,
+      pnl,
+      reason
+    );
+
+    if (
+      position.qty <
+      0.000000000001
+    ) {
+
+      delete state.positions[
+        position.address
+      ];
+
+      state.cooldowns[
+        position.address
+      ] =
+        Date.now() +
+        6 *
+        3600000;
+
+    }
+
+  }
+
+  function managePositions() {
+
+    var keys =
+      Object.keys(
+        state.positions
+      );
+
+    for (
+      var i = 0;
+      i < keys.length;
+      i++
+    ) {
+
+      var position =
+        state.positions[
+          keys[i]
+        ];
+
+      var market =
+        findToken(
+          position.address
+        );
+
+      if (!market) {
+        continue;
+      }
+
+      var px =
+        market.price;
+
+      position.last =
+        px;
+
+      position.high =
+        Math.max(
+          position.high ||
+          position.entry,
+          px
+        );
+
+      var ret =
+        px /
+        position.entry -
+        1;
+
+      if (
+        ret <=
+        -0.10
+      ) {
+
+        closePosition(
+          position,
+          1,
+          px,
+          "Hard stop -10%"
+        );
+
+        continue;
+      }
+
+      if (
+        market.liquidity <
+        position.entryLiquidity *
+        0.65
+      ) {
+
+        closePosition(
+          position,
+          1,
+          px,
+          "Liquidity drop"
+        );
+
+        continue;
+      }
+
+      if (
+        !position.tp1 &&
+        ret >=
+        0.15
+      ) {
+
+        closePosition(
+          position,
+          0.40,
+          px,
+          "TP1 +15%"
+        );
+
+        position.tp1 =
+          true;
+
+        continue;
+      }
+
+      if (
+        position.tp1 &&
+        !position.tp2 &&
+        ret >=
+        0.30
+      ) {
+
+        closePosition(
+          position,
+          0.50,
+          px,
+          "TP2 +30%"
+        );
+
+        position.tp2 =
+          true;
+
+        continue;
+      }
+
+      if (
+        position.tp1 &&
+        px <=
+        position.high *
+        0.90
+      ) {
+
+        closePosition(
+          position,
+          1,
+          px,
+          "Trailing stop"
+        );
+
+        continue;
+      }
+
+      if (
+        !position.tp1 &&
+        Date.now() -
+        position.opened >
+        120 *
+        60000
+      ) {
+
+        closePosition(
+          position,
+          1,
+          px,
+          "120m time stop"
+        );
+      }
+
+    }
+
+  }
+
+  function enterPositions() {
+
+    var equity =
+      getEquity();
+
+    var slots =
+      4 -
+      Object.keys(
+        state.positions
+      ).length;
+
+    var room =
+      Math.max(
         0,
+        equity.equity *
+        0.20 -
+        equity.positionValue
+      );
+
+    var candidates =
+      [];
+
+    for (
+      var i = 0;
+      i < universe.length;
+      i++
+    ) {
+
+      var token =
+        universe[i];
+
+      var evaluation =
+        evaluate(token);
+
+      if (
+        evaluation.decision ===
+        "BUY"
+      ) {
+
+        candidates.push({
+          token:
+            token,
+          evaluation:
+            evaluation
+        });
+      }
+
+    }
+
+    candidates.sort(
+      function (a, b) {
+        return (
+          b.evaluation.score -
+          a.evaluation.score
+        );
+      }
+    );
+
+    for (
+      var c = 0;
+      c < candidates.length;
+      c++
+    ) {
+
+      if (
+        slots <= 0 ||
+        room < 50
+      ) {
+        break;
+      }
+
+      var item =
+        candidates[c];
+
+      var p =
+        item.token;
+
+      if (
+        state.positions[
+          p.address
+        ]
+      ) {
+        continue;
+      }
+
+      if (
+        Date.now() <
+        (
+          state.cooldowns[
+            p.address
+          ] || 0
+        )
+      ) {
+        continue;
+      }
+
+      var size =
+        Math.min(
+          equity.equity *
+          0.05,
+          600,
+          room,
+          state.cash /
+          1.005
+        );
+
+      if (
+        size <
+        50
+      ) {
+        continue;
+      }
+
+      var entryFee =
+        size *
+        0.005;
+
+      state.cash -=
+        size +
+        entryFee;
+
+      state.fees +=
+        entryFee;
+
+      var qty =
+        size /
+        p.price;
+
+      state.positions[
+        p.address
+      ] = {
+        address:
+          p.address,
+
+        symbol:
+          p.symbol,
+
+        entry:
+          p.price,
+
+        last:
+          p.price,
+
+        high:
+          p.price,
+
+        qty:
+          qty,
+
+        opened:
+          Date.now(),
+
+        entryLiquidity:
+          p.liquidity,
+
+        tp1:
+          false,
+
+        tp2:
+          false,
+
+        score:
+          item.evaluation.score
+      };
+
+      addTrade(
+        "BUY",
+        state.positions[
+          p.address
+        ],
+        p.price,
+        size,
+        -entryFee,
+        "Score " +
+          item.evaluation.score
+      );
+
+      slots -=
+        1;
+
+      room -=
+        size;
+
+    }
+
+  }
+
+  function recordEquity() {
+
+    var value =
+      getEquity()
+        .equity;
+
+    var history =
+      state.equityHistory;
+
+    var last =
+      history[
+        history.length -
+        1
+      ];
+
+    if (
+      !last ||
+      Math.abs(
+        last.equity -
+        value
+      ) >
+      0.01 ||
+      Date.now() -
+      last.time >
+      300000
+    ) {
+
+      history.push({
+        time:
+          Date.now(),
+
+        equity:
+          value
+      });
+
+    }
+
+    if (
+      history.length >
+      2000
+    ) {
+      state.equityHistory =
+        history.slice(
+          -2000
+        );
+    }
+
+  }
+
+  function maxDrawdown() {
+
+    var peak =
+      0;
+
+    var maximum =
+      0;
+
+    for (
+      var i = 0;
+      i <
+      state.equityHistory.length;
+      i++
+    ) {
+
+      var value =
+        state.equityHistory[
+          i
+        ].equity;
+
+      peak =
+        Math.max(
+          peak,
+          value
+        );
+
+      if (peak) {
+
+        maximum =
+          Math.max(
+            maximum,
+            (
+              peak -
+              value
+            ) /
+            peak
+          );
+      }
+
+    }
+
+    return maximum *
+      100;
+
+  }
+
+  async function scan() {
+
+    if (scanning) {
+      return;
+    }
+
+    scanning =
+      true;
+
+    byId(
+      "scanBtn"
+    ).disabled =
+      true;
+
+    byId(
+      "scanBtn"
+    ).textContent =
+      "Scanning...";
+
+    var errorBox =
+      byId(
+        "error"
+      );
+
+    errorBox.style.display =
+      "none";
+
+    try {
+
+      var response =
+        await fetch(
+          "/api/market?t=" +
+          Date.now(),
+          {
+            cache:
+              "no-store"
+          }
+        );
+
+      if (!response.ok) {
+
+        var text =
+          await response.text();
+
+        throw new Error(
+          "HTTP " +
+          response.status +
+          " " +
+          text
+        );
+      }
+
+      var data =
+        await response.json();
+
+      if (
+        !Array.isArray(data)
+      ) {
+        throw new Error(
+          "Invalid market data"
+        );
+      }
+
+      universe =
+        data;
+
+      managePositions();
+
+      enterPositions();
+
+      recordEquity();
+
+      save();
+
+      render();
+
+      byId(
+        "lastScan"
+      ).textContent =
+        "Last scan " +
+        new Date()
+          .toLocaleTimeString();
+
+    } catch (error) {
+
+      console.error(
+        error
+      );
+
+      errorBox.textContent =
+        "行情抓取失敗：" +
+        error.message;
+
+      errorBox.style.display =
+        "block";
+
+    } finally {
+
+      scanning =
+        false;
+
+      nextScanAt =
+        Date.now() +
+        SCAN_MS;
+
+      byId(
+        "scanBtn"
+      ).disabled =
+        false;
+
+      byId(
+        "scanBtn"
+      ).textContent =
+        "Scan Now";
+    }
+
+  }
+
+  function render() {
+
+    var equity =
+      getEquity();
+
+    var total =
+      equity.equity -
+      START_BALANCE;
+
+    byId(
+      "equity"
+    ).textContent =
+      money(
+        equity.equity
+      ) +
+      " U";
+
+    byId(
+      "cash"
+    ).textContent =
+      money(
+        state.cash
+      ) +
+      " U";
+
+    var totalElement =
+      byId(
+        "totalPnl"
+      );
+
+    totalElement.textContent =
+      (
+        total >= 0
+          ? "+"
+          : ""
+      ) +
+      money(total) +
+      " U";
+
+    totalElement.className =
+      "value " +
+      color(total);
+
+    var realized =
+      byId(
+        "realized"
+      );
+
+    realized.textContent =
+      (
+        state.realized >= 0
+          ? "+"
+          : ""
+      ) +
+      money(
+        state.realized
+      ) +
+      " U";
+
+    realized.className =
+      "value " +
+      color(
+        state.realized
+      );
+
+    var unrealized =
+      byId(
+        "unrealized"
+      );
+
+    unrealized.textContent =
+      (
+        equity.unrealized >= 0
+          ? "+"
+          : ""
+      ) +
+      money(
+        equity.unrealized
+      ) +
+      " U";
+
+    unrealized.className =
+      "value " +
+      color(
+        equity.unrealized
+      );
+
+    var sellTrades =
+      state.trades.filter(
+        function (trade) {
+          return (
+            trade.action ===
+            "SELL"
+          );
+        }
+      );
+
+    var wins =
+      sellTrades.filter(
+        function (trade) {
+          return (
+            trade.pnl >
+            0
+          );
+        }
+      ).length;
+
+    byId(
+      "winRate"
+    ).textContent =
+      sellTrades.length
+        ? (
+            wins /
+            sellTrades.length *
+            100
+          ).toFixed(1) +
+          "%"
+        : "—";
+
+    byId(
+      "maxDd"
+    ).textContent =
+      maxDrawdown()
+        .toFixed(1) +
+      "%";
+
+    byId(
+      "openCount"
+    ).textContent =
+      Object.keys(
+        state.positions
+      ).length;
+
+    var evaluations =
+      universe.map(
+        function (token) {
+          return {
+            token:
+              token,
+            evaluation:
+              evaluate(token)
+          };
+        }
+      );
+
+    byId(
+      "tokenCount"
+    ).textContent =
+      universe.length +
+      " tokens";
+
+    var candidates =
+      evaluations.filter(
+        function (item) {
+          return (
+            item.evaluation
+              .decision ===
+            "BUY"
+          );
+        }
+      );
+
+    byId(
+      "candidateCount"
+    ).textContent =
+      candidates.length;
+
+    if (
+      evaluations.length
+    ) {
+
+      var best =
+        0;
+
+      for (
+        var i = 0;
+        i < evaluations.length;
+        i++
+      ) {
+
+        best =
+          Math.max(
+            best,
+            evaluations[i]
+              .evaluation
+              .score
+          );
+      }
+
+      byId(
+        "bestScore"
+      ).textContent =
+        best;
+
+    } else {
+
+      byId(
+        "bestScore"
+      ).textContent =
+        "—";
+    }
+
+    byId(
+      "tradeCount"
+    ).textContent =
+      state.trades.length;
+
+    byId(
+      "fees"
+    ).textContent =
+      money(
+        state.fees
+      ) +
+      " U";
+
+    byId(
+      "exposure"
+    ).textContent =
+      (
+        equity.positionValue /
+        Math.max(
+          1,
+          equity.equity
+        ) *
         100
-      )
-      .map(t => \`
+      ).toFixed(1) +
+      "%";
 
-      <tr>
-
-      <td>
-      \${new Date(
-        t.time
-      ).toLocaleString()}
-      </td>
-
-      <td>
-      <b>
-      \${t.symbol}
-      </b>
-      </td>
-
-      <td>
-      \${t.action}
-      </td>
-
-      <td>
-      \${price(
-        t.price
-      )}
-      </td>
-
-      <td>
-      \${money(
-        t.amount
-      )} U
-      </td>
-
-      <td class="\${color(
-        t.pnl
-      )}">
-      \${t.pnl >= 0 ? "+" : ""}
-      \${money(
-        t.pnl
-      )} U
-      </td>
-
-      <td>
-      \${t.reason}
-      </td>
-
-      </tr>
-
-      \`)
-      .join("")
-    ||
-    \`
-    <tr>
-    <td colspan="7">
-    尚無交易
-    </td>
-    </tr>
-    \`;
-
-  drawChart();
-
-}
-
-function drawChart(){
-
-  const canvas =
-    document.getElementById(
-      "equityChart"
+    evaluations.sort(
+      function (a, b) {
+        return (
+          b.evaluation.score -
+          a.evaluation.score
+        );
+      }
     );
 
-  const ctx =
-    canvas.getContext("2d");
+    var feedRows =
+      [];
 
-  const w =
-    canvas.width;
+    for (
+      var f = 0;
+      f <
+      Math.min(
+        evaluations.length,
+        50
+      );
+      f++
+    ) {
 
-  const h =
-    canvas.height;
+      var item =
+        evaluations[f];
 
-  ctx.clearRect(
-    0,
-    0,
-    w,
-    h
-  );
+      var p =
+        item.token;
 
-  const data =
-    state.equityHistory;
+      var e =
+        item.evaluation;
 
-  if(!data.length){
-    return;
+      var className =
+        e.decision === "BUY"
+          ? "green"
+          : (
+              e.decision ===
+              "REJECT"
+                ? "red"
+                : "yellow"
+            );
+
+      feedRows.push(
+        "<tr>" +
+
+        "<td>" +
+        '<a target="_blank" href="' +
+        p.url +
+        '">' +
+        "<b>" +
+        p.symbol +
+        "</b>" +
+        "</a>" +
+        "</td>" +
+
+        "<td>" +
+        age(
+          p.createdAt
+        ) +
+        "</td>" +
+
+        "<td>" +
+        formatPrice(
+          p.price
+        ) +
+        "</td>" +
+
+        "<td>$" +
+        money(
+          p.liquidity /
+          1000
+        ) +
+        "k</td>" +
+
+        "<td>$" +
+        money(
+          p.volume5m /
+          1000
+        ) +
+        "k</td>" +
+
+        "<td>$" +
+        money(
+          p.volume1h /
+          1000
+        ) +
+        "k</td>" +
+
+        "<td>" +
+        p.buys5m +
+        "/" +
+        p.sells5m +
+        "</td>" +
+
+        '<td class="' +
+        color(
+          p.price5m
+        ) +
+        '">' +
+        p.price5m.toFixed(1) +
+        "%</td>" +
+
+        '<td class="' +
+        color(
+          p.price1h
+        ) +
+        '">' +
+        p.price1h.toFixed(1) +
+        "%</td>" +
+
+        "<td><b>" +
+        e.score +
+        "</b></td>" +
+
+        '<td class="' +
+        className +
+        '">' +
+        e.decision +
+        "</td>" +
+
+        "</tr>"
+      );
+
+    }
+
+    byId(
+      "feed"
+    ).innerHTML =
+      feedRows.join("") ||
+      (
+        "<tr>" +
+        '<td colspan="11">' +
+        "尚未取得市場資料" +
+        "</td>" +
+        "</tr>"
+      );
+
+    var positionRows =
+      [];
+
+    var positionKeys =
+      Object.keys(
+        state.positions
+      );
+
+    for (
+      var pIndex = 0;
+      pIndex <
+      positionKeys.length;
+      pIndex++
+    ) {
+
+      var position =
+        state.positions[
+          positionKeys[
+            pIndex
+          ]
+        ];
+
+      var px =
+        currentPrice(
+          position.address
+        ) ||
+        position.last ||
+        position.entry;
+
+      var value =
+        position.qty *
+        px;
+
+      var pnl =
+        value -
+        position.qty *
+        position.entry;
+
+      positionRows.push(
+        "<tr>" +
+
+        "<td><b>" +
+        position.symbol +
+        "</b></td>" +
+
+        "<td>" +
+        formatPrice(
+          position.entry
+        ) +
+        "</td>" +
+
+        "<td>" +
+        formatPrice(
+          px
+        ) +
+        "</td>" +
+
+        "<td>" +
+        money(value) +
+        " U</td>" +
+
+        '<td class="' +
+        color(pnl) +
+        '">' +
+        (
+          pnl >= 0
+            ? "+"
+            : ""
+        ) +
+        money(pnl) +
+        " U</td>" +
+
+        "<td>" +
+        age(
+          position.opened
+        ) +
+        "</td>" +
+
+        "</tr>"
+      );
+
+    }
+
+    byId(
+      "positions"
+    ).innerHTML =
+      positionRows.join("") ||
+      (
+        "<tr>" +
+        '<td colspan="6">' +
+        "目前沒有持倉" +
+        "</td>" +
+        "</tr>"
+      );
+
+    var tradeRows =
+      [];
+
+    for (
+      var t = 0;
+      t <
+      Math.min(
+        state.trades.length,
+        100
+      );
+      t++
+    ) {
+
+      var trade =
+        state.trades[t];
+
+      tradeRows.push(
+        "<tr>" +
+
+        "<td>" +
+        new Date(
+          trade.time
+        ).toLocaleString() +
+        "</td>" +
+
+        "<td><b>" +
+        trade.symbol +
+        "</b></td>" +
+
+        "<td>" +
+        trade.action +
+        "</td>" +
+
+        "<td>" +
+        formatPrice(
+          trade.price
+        ) +
+        "</td>" +
+
+        "<td>" +
+        money(
+          trade.amount
+        ) +
+        " U</td>" +
+
+        '<td class="' +
+        color(
+          trade.pnl
+        ) +
+        '">' +
+        (
+          trade.pnl >= 0
+            ? "+"
+            : ""
+        ) +
+        money(
+          trade.pnl
+        ) +
+        " U</td>" +
+
+        "<td>" +
+        trade.reason +
+        "</td>" +
+
+        "</tr>"
+      );
+
+    }
+
+    byId(
+      "trades"
+    ).innerHTML =
+      tradeRows.join("") ||
+      (
+        "<tr>" +
+        '<td colspan="7">' +
+        "尚無交易" +
+        "</td>" +
+        "</tr>"
+      );
+
+    drawChart();
+
   }
 
-  const values =
-    data.map(
-      x =>
-        x.equity
+  function drawChart() {
+
+    var canvas =
+      byId(
+        "equityChart"
+      );
+
+    var context =
+      canvas.getContext(
+        "2d"
+      );
+
+    var width =
+      canvas.width;
+
+    var height =
+      canvas.height;
+
+    context.clearRect(
+      0,
+      0,
+      width,
+      height
     );
 
-  let min =
-    Math.min(
-      ...values
-    );
+    var data =
+      state.equityHistory;
 
-  let max =
-    Math.max(
-      ...values
-    );
+    if (!data.length) {
+      return;
+    }
 
-  if(
-    max -
-    min <
-    1
-  ){
-    min -= 10;
-    max += 10;
-  }
+    var values =
+      data.map(
+        function (item) {
+          return item.equity;
+        }
+      );
 
-  ctx.strokeStyle =
-    "#31e986";
+    var minimum =
+      Math.min.apply(
+        null,
+        values
+      );
 
-  ctx.lineWidth =
-    2;
+    var maximum =
+      Math.max.apply(
+        null,
+        values
+      );
 
-  ctx.beginPath();
+    if (
+      maximum -
+      minimum <
+      1
+    ) {
+      minimum -= 10;
+      maximum += 10;
+    }
 
-  data.forEach(
-    (p,i) => {
+    context.strokeStyle =
+      "#31e986";
 
-      const x =
+    context.lineWidth =
+      2;
+
+    context.beginPath();
+
+    for (
+      var i = 0;
+      i < data.length;
+      i++
+    ) {
+
+      var x =
         10 +
         (
-          w -
+          width -
           20
         ) *
         (
@@ -2311,233 +2617,251 @@ function drawChart(){
           )
         );
 
-      const y =
-        h -
+      var y =
+        height -
         10 -
         (
-          h -
+          height -
           20
         ) *
         (
           (
-            p.equity -
-            min
+            data[i].equity -
+            minimum
           ) /
           (
-            max -
-            min
+            maximum -
+            minimum
           )
         );
 
-      if(i === 0){
-
-        ctx.moveTo(
+      if (i === 0) {
+        context.moveTo(
           x,
           y
         );
-
-      }else{
-
-        ctx.lineTo(
+      } else {
+        context.lineTo(
           x,
           y
         );
-
       }
 
     }
-  );
 
-  ctx.stroke();
+    context.stroke();
 
-}
-
-function resetAccount(){
-
-  if(
-    !confirm(
-      "確定重新從 10,000U 開始？"
-    )
-  ){
-    return;
   }
 
-  state =
-    freshState();
+  function resetAccount() {
 
-  save();
+    if (
+      !confirm(
+        "確定重新從 10,000U 開始？"
+      )
+    ) {
+      return;
+    }
+
+    state =
+      freshState();
+
+    save();
+
+    render();
+
+  }
+
+  byId(
+    "scanBtn"
+  ).addEventListener(
+    "click",
+    scan
+  );
+
+  byId(
+    "resetBtn"
+  ).addEventListener(
+    "click",
+    resetAccount
+  );
+
+  setInterval(
+    function () {
+
+      var seconds =
+        Math.max(
+          0,
+          Math.ceil(
+            (
+              nextScanAt -
+              Date.now()
+            ) /
+            1000
+          )
+        );
+
+      byId(
+        "nextScan"
+      ).textContent =
+        seconds +
+        "s";
+
+      if (
+        !scanning &&
+        Date.now() >=
+        nextScanAt
+      ) {
+        scan();
+      }
+
+    },
+    1000
+  );
 
   render();
 
-}
+  setTimeout(
+    scan,
+    500
+  );
 
-setInterval(
-  () => {
-
-    const remaining =
-      Math.max(
-        0,
-        Math.ceil(
-          (
-            nextScanAt -
-            Date.now()
-          ) /
-          1000
-        )
-      );
-
-    document.getElementById(
-      "nextScan"
-    ).textContent =
-      remaining +
-      "s";
-
-    if(
-      !scanning &&
-      Date.now() >=
-      nextScanAt
-    ){
-
-      scan();
-
-    }
-
-  },
-  1000
-);
-
-render();
-
-scan();
+})();
 
 </script>
 
 </body>
-
 </html>
 `;
 
-// ==============================
+// ============================================================
 // SERVER
-// ==============================
+// ============================================================
 
-const server =
-  http.createServer(
-    async (
-      req,
-      res
-    ) => {
+const server = http.createServer(
+  async function (req, res) {
+    try {
+      const url =
+        new URL(
+          req.url,
+          "http://localhost"
+        );
 
-      try{
-
-        const url =
-          new URL(
-            req.url,
-            "http://localhost"
-          );
-
-        if(
-          url.pathname ===
-          "/api/market"
-        ){
-
-          try{
-
-            const data =
-              await getMarketData();
-
-            res.writeHead(
-              200,
-              {
-                "content-type":
-                  "application/json; charset=utf-8",
-
-                "cache-control":
-                  "no-store",
-
-                "access-control-allow-origin":
-                  "*"
-              }
-            );
-
-            return res.end(
-              JSON.stringify(
-                data
-              )
-            );
-
-          }catch(e){
-
-            console.error(
-              "Market error:",
-              e
-            );
-
-            res.writeHead(
-              502,
-              {
-                "content-type":
-                  "application/json; charset=utf-8"
-              }
-            );
-
-            return res.end(
-              JSON.stringify({
-                error:
-                  String(
-                    e.message ||
-                    e
-                  )
-              })
-            );
-
-          }
-
-        }
-
+      if (
+        url.pathname ===
+        "/health"
+      ) {
         res.writeHead(
           200,
           {
             "content-type":
-              "text/html; charset=utf-8",
-
-            "cache-control":
-              "no-store"
+              "application/json"
           }
         );
 
         return res.end(
-          PAGE
+          JSON.stringify({
+            ok: true
+          })
         );
-
-      }catch(e){
-
-        res.writeHead(
-          500,
-          {
-            "content-type":
-              "text/plain; charset=utf-8"
-          }
-        );
-
-        res.end(
-          String(e)
-        );
-
       }
 
+      if (
+        url.pathname ===
+        "/api/market"
+      ) {
+        try {
+          const data =
+            await getMarketData();
+
+          res.writeHead(
+            200,
+            {
+              "content-type":
+                "application/json; charset=utf-8",
+
+              "cache-control":
+                "no-store",
+
+              "access-control-allow-origin":
+                "*"
+            }
+          );
+
+          return res.end(
+            JSON.stringify(
+              data
+            )
+          );
+        } catch (error) {
+          console.error(
+            "Market API error:",
+            error
+          );
+
+          res.writeHead(
+            502,
+            {
+              "content-type":
+                "application/json; charset=utf-8",
+
+              "cache-control":
+                "no-store"
+            }
+          );
+
+          return res.end(
+            JSON.stringify({
+              error:
+                error.message ||
+                String(error)
+            })
+          );
+        }
+      }
+
+      res.writeHead(
+        200,
+        {
+          "content-type":
+            "text/html; charset=utf-8",
+
+          "cache-control":
+            "no-store"
+        }
+      );
+
+      return res.end(
+        PAGE
+      );
+
+    } catch (error) {
+      console.error(
+        error
+      );
+
+      res.writeHead(
+        500,
+        {
+          "content-type":
+            "text/plain; charset=utf-8"
+        }
+      );
+
+      return res.end(
+        String(error)
+      );
     }
-  );
+  }
+);
 
 server.listen(
   PORT,
   "0.0.0.0",
-  () => {
-
+  function () {
     console.log(
-      "MemeHunter running on",
+      "MemeHunter running on port",
       PORT
     );
-
   }
 );

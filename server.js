@@ -4,44 +4,106 @@ const PORT = process.env.PORT || 10000;
 
 const CACHE_MS = 60000;
 
+// 模擬成本假設
+const DEX_FEE_RATE = 0.003;     // 0.30% swap / DEX fee
+const GAS_FEE_USD = 0.02;      // 每次 swap 模擬 gas + priority fee
+const MIN_SLIPPAGE = 0.0025;   // 0.25%
+const MAX_SLIPPAGE = 0.02;     // 2.00%
+
 let discoveryCache = {
   time: 0,
   tokens: []
 };
 
 // ============================================================
-// DEX SCREENER
+// HELPERS
 // ============================================================
 
+function clamp(value, min, max) {
+  return Math.max(
+    min,
+    Math.min(max, value)
+  );
+}
+
+function estimateSlippageRate(
+  tradeUsd,
+  liquidityUsd
+) {
+  const liquidity =
+    Math.max(
+      Number(liquidityUsd || 0),
+      1
+    );
+
+  const size =
+    Math.max(
+      Number(tradeUsd || 0),
+      0
+    );
+
+  // 流動性越差 / 單越大，滑價越高
+  const impact =
+    (size / liquidity) * 0.35;
+
+  return clamp(
+    MIN_SLIPPAGE + impact,
+    MIN_SLIPPAGE,
+    MAX_SLIPPAGE
+  );
+}
+
 async function fetchJson(url) {
-  const response = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      "User-Agent": "MemeHunter-Paper-Trader/2.0"
-    }
-  });
+  const response =
+    await fetch(
+      url,
+      {
+        headers: {
+          Accept:
+            "application/json",
+
+          "User-Agent":
+            "MemeHunter-Paper-Trader/3.0"
+        }
+      }
+    );
 
   if (!response.ok) {
     throw new Error(
-      "DEX Screener HTTP " + response.status
+      "DEX Screener HTTP " +
+      response.status
     );
   }
 
   return response.json();
 }
 
-async function fetchPairsByAddresses(addresses) {
+// ============================================================
+// DEX SCREENER DATA
+// ============================================================
+
+async function fetchPairsByAddresses(
+  addresses
+) {
   const unique = [
     ...new Set(
-      addresses.filter(Boolean)
+      (addresses || [])
+        .filter(Boolean)
     )
   ];
 
   let rawPairs = [];
 
-  for (let i = 0; i < unique.length; i += 30) {
+  for (
+    let i = 0;
+    i < unique.length;
+    i += 30
+  ) {
     const batch =
-      unique.slice(i, i + 30);
+      unique.slice(
+        i,
+        i + 30
+      );
 
     if (!batch.length) {
       continue;
@@ -57,6 +119,7 @@ async function fetchPairsByAddresses(addresses) {
       if (Array.isArray(data)) {
         rawPairs.push(...data);
       }
+
     } catch (error) {
       console.log(
         "Token batch error:",
@@ -70,32 +133,48 @@ async function fetchPairsByAddresses(addresses) {
 
   for (const pair of rawPairs) {
     if (!pair) continue;
-    if (pair.chainId !== "solana") continue;
-    if (!pair.baseToken) continue;
-    if (!pair.baseToken.address) continue;
-    if (!pair.priceUsd) continue;
+
+    if (
+      pair.chainId !==
+      "solana"
+    ) {
+      continue;
+    }
+
+    if (
+      !pair.baseToken ||
+      !pair.baseToken.address ||
+      !pair.priceUsd
+    ) {
+      continue;
+    }
 
     const address =
       pair.baseToken.address;
 
     const liquidity =
       Number(
-        pair.liquidity?.usd || 0
+        pair.liquidity?.usd ||
+        0
       );
 
     const old =
-      bestPairs.get(address);
+      bestPairs.get(
+        address
+      );
 
     const oldLiquidity =
       old
         ? Number(
-            old.liquidity?.usd || 0
+            old.liquidity?.usd ||
+            0
           )
         : 0;
 
     if (
       !old ||
-      liquidity > oldLiquidity
+      liquidity >
+      oldLiquidity
     ) {
       bestPairs.set(
         address,
@@ -112,13 +191,16 @@ async function fetchPairsByAddresses(addresses) {
 function normalizePair(pair) {
   return {
     address:
-      pair.baseToken?.address || "",
+      pair.baseToken?.address ||
+      "",
 
     pairAddress:
-      pair.pairAddress || "",
+      pair.pairAddress ||
+      "",
 
     symbol:
-      pair.baseToken?.symbol || "?",
+      pair.baseToken?.symbol ||
+      "?",
 
     name:
       pair.baseToken?.name ||
@@ -127,42 +209,50 @@ function normalizePair(pair) {
 
     price:
       Number(
-        pair.priceUsd || 0
+        pair.priceUsd ||
+        0
       ),
 
     liquidity:
       Number(
-        pair.liquidity?.usd || 0
+        pair.liquidity?.usd ||
+        0
       ),
 
     volume5m:
       Number(
-        pair.volume?.m5 || 0
+        pair.volume?.m5 ||
+        0
       ),
 
     volume1h:
       Number(
-        pair.volume?.h1 || 0
+        pair.volume?.h1 ||
+        0
       ),
 
     buys5m:
       Number(
-        pair.txns?.m5?.buys || 0
+        pair.txns?.m5?.buys ||
+        0
       ),
 
     sells5m:
       Number(
-        pair.txns?.m5?.sells || 0
+        pair.txns?.m5?.sells ||
+        0
       ),
 
     price5m:
       Number(
-        pair.priceChange?.m5 || 0
+        pair.priceChange?.m5 ||
+        0
       ),
 
     price1h:
       Number(
-        pair.priceChange?.h1 || 0
+        pair.priceChange?.h1 ||
+        0
       ),
 
     createdAt:
@@ -184,8 +274,8 @@ async function discoverTokens() {
   if (
     discoveryCache.tokens.length &&
     Date.now() -
-      discoveryCache.time <
-      CACHE_MS
+    discoveryCache.time <
+    CACHE_MS
   ) {
     return {
       tokens:
@@ -217,7 +307,7 @@ async function discoverTokens() {
     for (const result of results) {
       if (
         result.status ===
-          "fulfilled" &&
+        "fulfilled" &&
         Array.isArray(
           result.value
         )
@@ -232,15 +322,21 @@ async function discoverTokens() {
       ...new Set(
         discovery
           .filter(
-            item =>
-              item &&
-              item.chainId ===
-                "solana" &&
-              item.tokenAddress
+            function (item) {
+              return (
+                item &&
+                item.chainId ===
+                  "solana" &&
+                item.tokenAddress
+              );
+            }
           )
           .map(
-            item =>
-              item.tokenAddress
+            function (item) {
+              return (
+                item.tokenAddress
+              );
+            }
           )
       )
     ].slice(0, 90);
@@ -257,7 +353,9 @@ async function discoverTokens() {
       );
 
     const tokens =
-      pairs.map(normalizePair);
+      pairs.map(
+        normalizePair
+      );
 
     if (!tokens.length) {
       throw new Error(
@@ -269,11 +367,14 @@ async function discoverTokens() {
       time:
         Date.now(),
 
-      tokens
+      tokens:
+        tokens
     };
 
     return {
-      tokens,
+      tokens:
+        tokens,
+
       stale:
         false
     };
@@ -303,23 +404,47 @@ async function discoverTokens() {
 async function getMarketData(
   positionAddresses
 ) {
-  const discovery =
-    await discoverTokens();
+  let discovery;
+
+  try {
+    discovery =
+      await discoverTokens();
+
+  } catch (error) {
+    discovery = {
+      tokens: [],
+      stale: true
+    };
+
+    console.log(
+      "Discovery unavailable:",
+      error.message
+    );
+  }
 
   let positionTokens = [];
 
   if (
+    positionAddresses &&
     positionAddresses.length
   ) {
-    const positionPairs =
-      await fetchPairsByAddresses(
-        positionAddresses
-      );
+    try {
+      const positionPairs =
+        await fetchPairsByAddresses(
+          positionAddresses
+        );
 
-    positionTokens =
-      positionPairs.map(
-        normalizePair
+      positionTokens =
+        positionPairs.map(
+          normalizePair
+        );
+
+    } catch (error) {
+      console.log(
+        "Position refresh error:",
+        error.message
       );
+    }
   }
 
   const combined =
@@ -335,7 +460,7 @@ async function getMarketData(
     );
   }
 
-  // 持倉資料優先使用最新刷新結果
+  // 持倉幣最新行情優先
   for (
     const token
     of positionTokens
@@ -343,6 +468,14 @@ async function getMarketData(
     combined.set(
       token.address,
       token
+    );
+  }
+
+  if (
+    !combined.size
+  ) {
+    throw new Error(
+      "No market data available"
     );
   }
 
@@ -359,7 +492,7 @@ async function getMarketData(
 }
 
 // ============================================================
-// FRONTEND
+// HTML
 // ============================================================
 
 const PAGE = `
@@ -367,6 +500,7 @@ const PAGE = `
 <html lang="zh-Hant">
 
 <head>
+
 <meta charset="utf-8">
 
 <meta
@@ -374,15 +508,17 @@ const PAGE = `
   content="width=device-width,initial-scale=1"
 >
 
-<title>MemeHunter Live</title>
+<title>
+MemeHunter Live
+</title>
 
 <style>
 
-* {
+*{
   box-sizing:border-box;
 }
 
-body {
+body{
   margin:0;
   background:#080b0e;
   color:#edf3f7;
@@ -394,29 +530,29 @@ body {
     sans-serif;
 }
 
-.wrap {
+.wrap{
   max-width:1500px;
   margin:auto;
   padding:18px;
 }
 
-.top {
+.top{
   display:flex;
   gap:12px;
   align-items:center;
   flex-wrap:wrap;
 }
 
-h1 {
+h1{
   margin:0;
   font-size:23px;
 }
 
-.spacer {
+.spacer{
   flex:1;
 }
 
-.badge {
+.badge{
   color:#31e986;
   border:1px solid #17643d;
   background:#0b2518;
@@ -425,11 +561,11 @@ h1 {
   font-size:11px;
 }
 
-.status {
+.status{
   color:#31e986;
 }
 
-button {
+button{
   padding:9px 14px;
   border-radius:8px;
   border:1px solid #33404a;
@@ -438,37 +574,32 @@ button {
   cursor:pointer;
 }
 
-button:hover {
-  border-color:#60717e;
-}
-
-button:disabled {
+button:disabled{
   opacity:.6;
-  cursor:default;
 }
 
 .note,
-.warning {
+.warning{
   margin-top:14px;
-  border-radius:9px;
   padding:11px 13px;
+  border-radius:9px;
   font-size:12px;
 }
 
-.note {
+.note{
   background:#0f151b;
   border:1px solid #27323b;
   color:#9cabb7;
 }
 
-.warning {
+.warning{
   display:none;
-  background:#2a2110;
-  border:1px solid #68531b;
-  color:#f4c96e;
+  background:#2b2411;
+  border:1px solid #6d581c;
+  color:#f6ce72;
 }
 
-.error {
+.error{
   display:none;
   margin-top:12px;
   background:#2b1116;
@@ -478,12 +609,12 @@ button:disabled {
   border-radius:8px;
 }
 
-.grid {
+.grid{
   display:grid;
   gap:12px;
 }
 
-.kpis {
+.kpis{
   grid-template-columns:
     repeat(
       8,
@@ -494,99 +625,122 @@ button:disabled {
 }
 
 .card,
-.panel {
+.panel{
   background:#10161c;
   border:1px solid #26313a;
   border-radius:10px;
 }
 
-.card {
+.card{
   padding:14px;
 }
 
-.panel {
+.panel{
   margin-top:14px;
   padding:14px;
 }
 
-.label {
+.label{
   color:#8ca0af;
   font-size:11px;
 }
 
-.value {
+.value{
   margin-top:5px;
   font-size:21px;
   font-weight:800;
 }
 
-.green {
+.green{
   color:#31e986;
 }
 
-.red {
+.red{
   color:#ff6877;
 }
 
-.yellow {
+.yellow{
   color:#f2bc59;
 }
 
-.panel-title {
+.panel-title{
   display:flex;
-  justify-content:
-    space-between;
-
+  justify-content:space-between;
   align-items:center;
   gap:10px;
   margin-bottom:10px;
 }
 
-.panel-title h2 {
+.panel-title h2{
   margin:0;
   font-size:16px;
 }
 
-.small {
+.small{
   font-size:11px;
   color:#8999a6;
 }
 
-.two {
+.two{
   grid-template-columns:
     1.3fr .7fr;
 }
 
-.stats {
+.stats{
   display:grid;
   grid-template-columns:
     1fr 1fr;
   gap:8px;
 }
 
-.stat {
+.stat{
   padding:10px;
   background:#141c23;
   border-radius:7px;
 }
 
-.stat b {
+.stat b{
   float:right;
 }
 
-.scroll {
+.cost-grid{
+  display:grid;
+  grid-template-columns:
+    repeat(4,1fr);
+  gap:8px;
+  margin-top:10px;
+}
+
+.cost-item{
+  padding:9px;
+  background:#141c23;
+  border-radius:7px;
+}
+
+.cost-item span{
+  display:block;
+  font-size:10px;
+  color:#8999a6;
+}
+
+.cost-item b{
+  display:block;
+  margin-top:4px;
+}
+
+.scroll{
   overflow:auto;
   max-height:470px;
 }
 
-table {
+table{
   width:100%;
   border-collapse:collapse;
   font-size:12px;
 }
 
 th,
-td {
+td{
   text-align:left;
   padding:9px;
   border-bottom:
@@ -594,23 +748,23 @@ td {
   white-space:nowrap;
 }
 
-th {
+th{
   color:#8ca0af;
 }
 
-a {
+a{
   color:#8fcaff;
   text-decoration:none;
 }
 
-canvas {
+canvas{
   width:100%;
   height:170px;
   background:#0a0f13;
   border-radius:7px;
 }
 
-.strategy-grid {
+.strategy-grid{
   display:grid;
   grid-template-columns:
     repeat(3,1fr);
@@ -618,31 +772,31 @@ canvas {
   margin-top:10px;
 }
 
-.strategy-item {
+.strategy-item{
   background:#141c23;
   padding:9px;
   border-radius:7px;
 }
 
-.strategy-item span {
+.strategy-item span{
   color:#8999a6;
   font-size:10px;
 }
 
-.strategy-item b {
+.strategy-item b{
   display:block;
   margin-top:3px;
 }
 
-.evolution {
+.evolution{
   margin-top:10px;
   padding:10px;
+  background:#0d1318;
   border:1px solid #27323b;
   border-radius:8px;
-  background:#0d1318;
 }
 
-.evolution-entry {
+.evolution-entry{
   padding:8px 0;
   border-bottom:
     1px solid #1e272e;
@@ -650,40 +804,40 @@ canvas {
   line-height:1.6;
 }
 
-.evolution-entry:last-child {
-  border-bottom:0;
-}
+@media(max-width:1100px){
 
-@media(max-width:1100px) {
-
-  .kpis {
+  .kpis{
     grid-template-columns:
       repeat(4,1fr);
   }
 
-  .two {
+  .two{
     grid-template-columns:1fr;
   }
 
-  .strategy-grid {
+  .cost-grid{
     grid-template-columns:
       repeat(2,1fr);
   }
+
 }
 
-@media(max-width:650px) {
+@media(max-width:650px){
 
-  .kpis {
+  .kpis{
     grid-template-columns:
       repeat(2,1fr);
   }
 
-  .strategy-grid {
-    grid-template-columns:1fr;
+  .strategy-grid{
+    grid-template-columns:
+      1fr 1fr;
   }
+
 }
 
 </style>
+
 </head>
 
 <body>
@@ -730,9 +884,17 @@ Reset 10,000U
 </div>
 
 <div class="note">
-真實 Solana DEX 行情 + 10,000U 模擬資金。
-網站開著時自動掃描、管理持倉與 Strategy Evolution。
-不連接錢包、不使用真錢。
+
+真實 Solana meme 行情 +
+真實成本模擬。
+
+成本包含：
+DEX fee、動態滑價、
+Solana gas / priority fee。
+
++50% 後切換保本模式，
++100% 後保留 Runner 尋找金狗。
+
 </div>
 
 <div
@@ -748,99 +910,123 @@ Reset 10,000U
 <div class="grid kpis">
 
 <div class="card">
+
 <div class="label">
 EQUITY
 </div>
+
 <div
   id="equity"
   class="value"
 >
 10,000.00 U
 </div>
+
 </div>
 
 <div class="card">
+
 <div class="label">
 CASH
 </div>
+
 <div
   id="cash"
   class="value"
 >
 10,000.00 U
 </div>
+
 </div>
 
 <div class="card">
+
 <div class="label">
 TOTAL PNL
 </div>
+
 <div
   id="totalPnl"
   class="value"
 >
 0.00 U
 </div>
+
 </div>
 
 <div class="card">
+
 <div class="label">
 REALIZED
 </div>
+
 <div
   id="realized"
   class="value"
 >
 0.00 U
 </div>
+
 </div>
 
 <div class="card">
+
 <div class="label">
 UNREALIZED
 </div>
+
 <div
   id="unrealized"
   class="value"
 >
 0.00 U
 </div>
+
 </div>
 
 <div class="card">
+
 <div class="label">
 WIN RATE
 </div>
+
 <div
   id="winRate"
   class="value"
 >
 —
 </div>
+
 </div>
 
 <div class="card">
+
 <div class="label">
 MAX DRAWDOWN
 </div>
+
 <div
   id="maxDd"
   class="value"
 >
 0.0%
 </div>
+
 </div>
 
 <div class="card">
+
 <div class="label">
 OPEN POSITIONS
 </div>
+
 <div
   id="openCount"
   class="value"
 >
 0
 </div>
+
 </div>
 
 </div>
@@ -913,8 +1099,8 @@ Market Monitor
 </div>
 
 <div class="stat">
-模擬成本
-<b id="fees">
+總成本
+<b id="totalCosts">
 0 U
 </b>
 </div>
@@ -930,6 +1116,46 @@ Market Monitor
 下次掃描
 <b id="nextScan">
 —
+</b>
+</div>
+
+</div>
+
+<div class="cost-grid">
+
+<div class="cost-item">
+<span>
+DEX FEES
+</span>
+<b id="dexFees">
+0 U
+</b>
+</div>
+
+<div class="cost-item">
+<span>
+SLIPPAGE
+</span>
+<b id="slippageCosts">
+0 U
+</b>
+</div>
+
+<div class="cost-item">
+<span>
+GAS / PRIORITY
+</span>
+<b id="gasCosts">
+0 U
+</b>
+</div>
+
+<div class="cost-item">
+<span>
+TOTAL
+</span>
+<b id="allCosts">
+0 U
 </b>
 </div>
 
@@ -996,7 +1222,7 @@ Live Hunter Feed
 </h2>
 
 <span class="small">
-真實價格 • 模擬資金
+Runner / BE 會顯示
 </span>
 
 </div>
@@ -1014,7 +1240,9 @@ Live Hunter Feed
 <th>Now</th>
 <th>Value</th>
 <th>PnL</th>
-<th>Age</th>
+<th>High</th>
+<th>Stop</th>
+<th>Mode</th>
 
 </tr>
 
@@ -1033,11 +1261,11 @@ Live Hunter Feed
 <div class="panel-title">
 
 <h2>
-Strategy Evolution
+金狗出場模式
 </h2>
 
 <span class="small">
-自動調參 • 有風控上限
+保本 + Runner
 </span>
 
 </div>
@@ -1046,55 +1274,55 @@ Strategy Evolution
 
 <div class="strategy-item">
 <span>
-Score 門檻
-</span>
-<b id="strategyScore">
-68
-</b>
-</div>
-
-<div class="strategy-item">
-<span>
-Buy / Sell
-</span>
-<b id="strategyRatio">
-1.15
-</b>
-</div>
-
-<div class="strategy-item">
-<span>
-單筆倉位
-</span>
-<b id="strategySize">
-5.0%
-</b>
-</div>
-
-<div class="strategy-item">
-<span>
-Stop Loss
+Initial SL
 </span>
 <b id="strategySl">
--10%
+-12%
 </b>
 </div>
 
 <div class="strategy-item">
 <span>
-TP1
++35%
 </span>
-<b id="strategyTp1">
-+15%
+<b>
+出 20%
 </b>
 </div>
 
 <div class="strategy-item">
 <span>
-TP2
++50%
 </span>
-<b id="strategyTp2">
-+30%
+<b>
+出 20% + BE
+</b>
+</div>
+
+<div class="strategy-item">
+<span>
++100%
+</span>
+<b>
+出 20%
+</b>
+</div>
+
+<div class="strategy-item">
+<span>
+Runner
+</span>
+<b id="strategyTrail">
+28% Trail
+</b>
+</div>
+
+<div class="strategy-item">
+<span>
+剩餘 Runner
+</span>
+<b>
+40%
 </b>
 </div>
 
@@ -1103,7 +1331,7 @@ TP2
 <div class="evolution">
 
 <div class="small">
-最近策略調整
+Strategy Evolution
 </div>
 
 <div id="evolutionLog"></div>
@@ -1123,7 +1351,7 @@ TP2
 </h2>
 
 <span class="small">
-沒有預塞假交易
+PnL 已扣實際模擬成本
 </span>
 
 </div>
@@ -1139,9 +1367,11 @@ TP2
 <th>Time</th>
 <th>Token</th>
 <th>Action</th>
-<th>Price</th>
+<th>Market</th>
+<th>Execution</th>
 <th>Amount</th>
 <th>PnL</th>
+<th>Costs</th>
 <th>Reason</th>
 
 </tr>
@@ -1160,12 +1390,13 @@ TP2
 
 <script>
 
-(function () {
+(function(){
 
 "use strict";
 
+// 沿用舊版本 storage，避免自動歸零
 var KEY =
-  "memehunter_live_evolution_v1";
+  "memehunter_live_v2";
 
 var START_BALANCE =
   10000;
@@ -1176,6 +1407,18 @@ var SCAN_MS =
 var EVOLUTION_MS =
   12 * 60 * 60 * 1000;
 
+var DEX_FEE_RATE =
+  0.003;
+
+var GAS_FEE_USD =
+  0.02;
+
+var MIN_SLIPPAGE =
+  0.0025;
+
+var MAX_SLIPPAGE =
+  0.02;
+
 var universe =
   [];
 
@@ -1183,36 +1426,66 @@ var scanning =
   false;
 
 var nextScanAt =
-  Date.now() + 2000;
+  Date.now() +
+  2000;
 
-function byId(id) {
+function byId(id){
   return document.getElementById(id);
 }
 
-function defaultStrategy() {
+function clamp(
+  value,
+  min,
+  max
+){
+  return Math.max(
+    min,
+    Math.min(
+      max,
+      value
+    )
+  );
+}
+
+function defaultStrategy(){
   return {
     scoreMin:68,
     ratioMin:1.15,
+
     positionPct:0.05,
-    stopLoss:0.10,
-    tp1:0.15,
-    tp2:0.30,
+
     maxPositions:4,
-    maxExposure:0.20
+    maxExposure:0.20,
+
+    stopLoss:0.12,
+
+    firstTp:0.35,
+    beTrigger:0.50,
+    runnerTrigger:1.00,
+
+    runnerTrail:0.28,
+
+    timeStopMinutes:180
   };
 }
 
-function freshState() {
+function freshState(){
   return {
     cash:10000,
+
     realized:0,
-    fees:0,
 
     positions:{},
 
     trades:[],
 
     cooldowns:{},
+
+    costs:{
+      dex:0,
+      slippage:0,
+      gas:0
+    },
 
     equityHistory:[
       {
@@ -1234,24 +1507,86 @@ function freshState() {
 
 var state;
 
-try {
+try{
   state =
     JSON.parse(
       localStorage.getItem(KEY)
     ) ||
     freshState();
-} catch (error) {
+
+}catch(error){
   state =
     freshState();
 }
 
-// 舊資料缺欄位時補齊
-if (!state.strategy) {
+// ============================================================
+// MIGRATION
+// ============================================================
+
+if(
+  typeof state.cash !==
+  "number"
+){
+  state.cash =
+    10000;
+}
+
+if(
+  typeof state.realized !==
+  "number"
+){
+  state.realized =
+    0;
+}
+
+if(
+  !state.positions
+){
+  state.positions =
+    {};
+}
+
+if(
+  !state.trades
+){
+  state.trades =
+    [];
+}
+
+if(
+  !state.cooldowns
+){
+  state.cooldowns =
+    {};
+}
+
+if(
+  !state.equityHistory
+){
+  state.equityHistory = [
+    {
+      time:Date.now(),
+      equity:10000
+    }
+  ];
+}
+
+if(
+  !state.strategy
+){
   state.strategy =
     defaultStrategy();
 }
 
-if (!state.evolution) {
+state.strategy =
+  Object.assign(
+    defaultStrategy(),
+    state.strategy
+  );
+
+if(
+  !state.evolution
+){
   state.evolution = {
     lastTime:0,
     lastClosedCount:0,
@@ -1259,14 +1594,122 @@ if (!state.evolution) {
   };
 }
 
-function save() {
+if(
+  !state.costs
+){
+  state.costs = {
+    // 把舊版 fees 當成 legacy DEX cost
+    dex:
+      Number(
+        state.fees || 0
+      ),
+
+    slippage:0,
+    gas:0
+  };
+}
+
+// 舊版 position migration
+Object.keys(
+  state.positions
+).forEach(
+  function(address){
+
+    var p =
+      state.positions[
+        address
+      ];
+
+    if(
+      !p.initialQty
+    ){
+      p.initialQty =
+        Number(
+          p.qty || 0
+        );
+    }
+
+    if(
+      !p.marketEntry
+    ){
+      p.marketEntry =
+        Number(
+          p.entry || 0
+        );
+    }
+
+    if(
+      !p.totalCost
+    ){
+      p.totalCost =
+        Number(
+          p.qty || 0
+        ) *
+        Number(
+          p.entry || 0
+        );
+    }
+
+    if(
+      typeof p.realizedNetProceeds !==
+      "number"
+    ){
+      p.realizedNetProceeds =
+        0;
+    }
+
+    if(
+      typeof p.firstTpDone !==
+      "boolean"
+    ){
+      p.firstTpDone =
+        false;
+    }
+
+    if(
+      typeof p.beActive !==
+      "boolean"
+    ){
+      p.beActive =
+        false;
+    }
+
+    if(
+      typeof p.runnerActive !==
+      "boolean"
+    ){
+      p.runnerActive =
+        false;
+    }
+
+    if(
+      !p.high
+    ){
+      p.high =
+        p.entry;
+    }
+
+    if(
+      typeof p.sellPressureCount !==
+      "number"
+    ){
+      p.sellPressureCount =
+        0;
+    }
+
+  }
+);
+
+function save(){
   localStorage.setItem(
     KEY,
-    JSON.stringify(state)
+    JSON.stringify(
+      state
+    )
   );
 }
 
-function money(value) {
+function money(value){
   return Number(
     value || 0
   ).toLocaleString(
@@ -1278,90 +1721,76 @@ function money(value) {
   );
 }
 
-function formatPrice(value) {
+function formatPrice(value){
   var number =
-    Number(value || 0);
+    Number(
+      value || 0
+    );
 
-  if (!number) {
+  if(!number){
     return "—";
   }
 
-  if (number >= 1) {
+  if(number >= 1){
     return "$" +
       number.toFixed(4);
   }
 
   return "$" +
-    number.toPrecision(5);
+    number.toPrecision(6);
 }
 
-function color(value) {
-  if (value > 0) {
+function color(value){
+  if(value > 0){
     return "green";
   }
 
-  if (value < 0) {
+  if(value < 0){
     return "red";
   }
 
   return "";
 }
 
-function age(timestamp) {
-  var seconds =
+function estimateSlippageRate(
+  tradeUsd,
+  liquidity
+){
+  var liq =
     Math.max(
-      0,
+      Number(
+        liquidity || 0
+      ),
+      1
+    );
+
+  var trade =
+    Math.max(
+      Number(
+        tradeUsd || 0
+      ),
+      0
+    );
+
+  return clamp(
+    MIN_SLIPPAGE +
       (
-        Date.now() -
-        timestamp
-      ) /
-      1000
-    );
+        trade /
+        liq
+      ) *
+      0.35,
 
-  if (seconds < 3600) {
-    return (
-      Math.floor(
-        seconds /
-        60
-      ) +
-      "m"
-    );
-  }
+    MIN_SLIPPAGE,
 
-  if (seconds < 86400) {
-    return (
-      (
-        seconds /
-        3600
-      ).toFixed(1) +
-      "h"
-    );
-  }
-
-  return (
-    (
-      seconds /
-      86400
-    ).toFixed(1) +
-    "d"
+    MAX_SLIPPAGE
   );
 }
 
-function clamp(
-  value,
-  minimum,
-  maximum
-) {
-  return Math.max(
-    minimum,
-    Math.min(
-      maximum,
-      value
-    )
-  );
-}
+// ============================================================
+// STRATEGY SCORE
+// ============================================================
 
-function tokenScore(p) {
+function tokenScore(p){
   var score =
     0;
 
@@ -1402,17 +1831,17 @@ function tokenScore(p) {
       ratio * 7
     );
 
-  if (
+  if(
     p.price5m > 0 &&
     p.price5m < 40
-  ) {
+  ){
     score += 8;
   }
 
-  if (
+  if(
     p.price1h > 0 &&
     p.price1h < 150
-  ) {
+  ){
     score += 7;
   }
 
@@ -1423,14 +1852,15 @@ function tokenScore(p) {
     ) /
     3600000;
 
-  if (
+  if(
     hours >= 0.25 &&
     hours <= 24
-  ) {
+  ){
     score += 10;
-  } else if (
+
+  }else if(
     hours <= 72
-  ) {
+  ){
     score += 6;
   }
 
@@ -1442,8 +1872,8 @@ function tokenScore(p) {
   );
 }
 
-function evaluate(p) {
-  var strategy =
+function evaluate(p){
+  var s =
     state.strategy;
 
   var score =
@@ -1452,67 +1882,65 @@ function evaluate(p) {
   var reasons =
     [];
 
-  var pairMinutes =
+  var ageMinutes =
     (
       Date.now() -
       p.createdAt
     ) /
     60000;
 
-  if (
+  if(
     p.liquidity <
     50000
-  ) {
+  ){
     reasons.push(
       "Liquidity"
     );
   }
 
-  if (
+  if(
     p.volume1h <
     15000
-  ) {
+  ){
     reasons.push(
       "Volume"
     );
   }
 
-  if (
-    (
-      p.buys5m +
-      p.sells5m
-    ) <
+  if(
+    p.buys5m +
+    p.sells5m <
     15
-  ) {
+  ){
     reasons.push(
       "Activity"
     );
   }
 
-  if (
-    pairMinutes <
+  if(
+    ageMinutes <
     5
-  ) {
+  ){
     reasons.push(
       "TooNew"
     );
   }
 
-  if (
+  if(
     p.price5m >
-    40 ||
+      40 ||
     p.price1h >
-    150
-  ) {
+      150
+  ){
     reasons.push(
       "FOMO"
     );
   }
 
-  if (
+  if(
     score <
-    strategy.scoreMin
-  ) {
+    s.scoreMin
+  ){
     reasons.push(
       "Score"
     );
@@ -1525,18 +1953,20 @@ function evaluate(p) {
       p.sells5m
     );
 
-  if (
+  if(
     ratio <
-    strategy.ratioMin
-  ) {
+    s.ratioMin
+  ){
     reasons.push(
       "BuySell"
     );
   }
 
-  if (!reasons.length) {
+  if(
+    !reasons.length
+  ){
     return {
-      score,
+      score:score,
       decision:"BUY"
     };
   }
@@ -1553,7 +1983,7 @@ function evaluate(p) {
     ) !== -1;
 
   return {
-    score,
+    score:score,
     decision:
       hard
         ? "REJECT"
@@ -1561,16 +1991,20 @@ function evaluate(p) {
   };
 }
 
-function findToken(address) {
-  for (
+// ============================================================
+// MARKET HELPERS
+// ============================================================
+
+function findToken(address){
+  for(
     var i = 0;
     i < universe.length;
     i++
-  ) {
-    if (
+  ){
+    if(
       universe[i].address ===
       address
-    ) {
+    ){
       return universe[i];
     }
   }
@@ -1578,20 +2012,22 @@ function findToken(address) {
   return null;
 }
 
-function currentPrice(address) {
+function currentPrice(address){
   var token =
-    findToken(address);
+    findToken(
+      address
+    );
 
   return token
     ? token.price
     : 0;
 }
 
-function getEquity() {
+function getEquity(){
   var positionValue =
     0;
 
-  var cost =
+  var rawCostRemaining =
     0;
 
   var keys =
@@ -1599,11 +2035,11 @@ function getEquity() {
       state.positions
     );
 
-  for (
+  for(
     var i = 0;
     i < keys.length;
     i++
-  ) {
+  ){
     var p =
       state.positions[
         keys[i]
@@ -1620,9 +2056,15 @@ function getEquity() {
       p.qty *
       px;
 
-    cost +=
-      p.qty *
-      p.entry;
+    var ratio =
+      p.initialQty
+        ? p.qty /
+          p.initialQty
+        : 1;
+
+    rawCostRemaining +=
+      p.totalCost *
+      ratio;
   }
 
   return {
@@ -1630,22 +2072,175 @@ function getEquity() {
       state.cash +
       positionValue,
 
-    positionValue,
+    positionValue:
+      positionValue,
 
     unrealized:
       positionValue -
-      cost
+      rawCostRemaining
   };
 }
+
+function totalCosts(){
+  return (
+    Number(
+      state.costs.dex || 0
+    ) +
+    Number(
+      state.costs.slippage || 0
+    ) +
+    Number(
+      state.costs.gas || 0
+    )
+  );
+}
+
+// ============================================================
+// EXECUTION MODEL
+// ============================================================
+
+function simulateBuy(
+  marketPrice,
+  notional,
+  liquidity
+){
+  var slippageRate =
+    estimateSlippageRate(
+      notional,
+      liquidity
+    );
+
+  var executionPrice =
+    marketPrice *
+    (
+      1 +
+      slippageRate
+    );
+
+  var dexFee =
+    notional *
+    DEX_FEE_RATE;
+
+  var gas =
+    GAS_FEE_USD;
+
+  var slippageCost =
+    notional *
+    slippageRate;
+
+  var qty =
+    notional /
+    executionPrice;
+
+  return {
+    executionPrice:
+      executionPrice,
+
+    qty:
+      qty,
+
+    dexFee:
+      dexFee,
+
+    gas:
+      gas,
+
+    slippageRate:
+      slippageRate,
+
+    slippageCost:
+      slippageCost,
+
+    cashCost:
+      notional +
+      dexFee +
+      gas
+  };
+}
+
+function simulateSell(
+  qty,
+  marketPrice,
+  liquidity
+){
+  var marketGross =
+    qty *
+    marketPrice;
+
+  var slippageRate =
+    estimateSlippageRate(
+      marketGross,
+      liquidity
+    );
+
+  var executionPrice =
+    marketPrice *
+    (
+      1 -
+      slippageRate
+    );
+
+  var executedGross =
+    qty *
+    executionPrice;
+
+  var dexFee =
+    executedGross *
+    DEX_FEE_RATE;
+
+  var gas =
+    GAS_FEE_USD;
+
+  var net =
+    executedGross -
+    dexFee -
+    gas;
+
+  var slippageCost =
+    marketGross -
+    executedGross;
+
+  return {
+    marketGross:
+      marketGross,
+
+    executionPrice:
+      executionPrice,
+
+    executedGross:
+      executedGross,
+
+    dexFee:
+      dexFee,
+
+    gas:
+      gas,
+
+    net:
+      net,
+
+    slippageRate:
+      slippageRate,
+
+    slippageCost:
+      slippageCost
+  };
+}
+
+// ============================================================
+// TRADE LOG
+// ============================================================
 
 function addTrade(
   action,
   position,
-  px,
+  marketPrice,
+  executionPrice,
   amount,
   pnl,
+  costs,
   reason
-) {
+){
   state.trades.unshift({
     time:
       Date.now(),
@@ -1653,15 +2248,36 @@ function addTrade(
     symbol:
       position.symbol,
 
-    action,
+    action:
+      action,
 
-    price:px,
+    marketPrice:
+      marketPrice,
 
-    amount,
+    executionPrice:
+      executionPrice,
 
-    pnl,
+    amount:
+      amount,
 
-    reason
+    pnl:
+      pnl,
+
+    costs:
+      costs,
+
+    reason:
+      reason,
+
+    maxReturn:
+      position.high &&
+      position.entry
+        ? (
+            position.high /
+            position.entry -
+            1
+          )
+        : 0
   });
 
   state.trades =
@@ -1671,64 +2287,213 @@ function addTrade(
     );
 }
 
-function closePosition(
+// ============================================================
+// TRUE BREAK EVEN
+// ============================================================
+
+function calculateBreakEvenPrice(
   position,
-  fraction,
-  px,
+  market
+){
+  if(
+    !position.qty ||
+    position.qty <= 0
+  ){
+    return (
+      position.entry
+    );
+  }
+
+  var requiredNet =
+    position.totalCost -
+    position.realizedNetProceeds;
+
+  if(
+    requiredNet <= 0
+  ){
+    return (
+      position.entry *
+      1.002
+    );
+  }
+
+  var guess =
+    position.entry;
+
+  for(
+    var i = 0;
+    i < 4;
+    i++
+  ){
+    var gross =
+      position.qty *
+      guess;
+
+    var slip =
+      estimateSlippageRate(
+        gross,
+        market.liquidity
+      );
+
+    var multiplier =
+      (
+        1 -
+        slip
+      ) *
+      (
+        1 -
+        DEX_FEE_RATE
+      );
+
+    var grossNeeded =
+      (
+        requiredNet +
+        GAS_FEE_USD
+      ) /
+      Math.max(
+        multiplier,
+        0.90
+      );
+
+    guess =
+      grossNeeded /
+      position.qty;
+  }
+
+  // 至少拉到接近進場價以上
+  return Math.max(
+    guess,
+    position.entry *
+    1.003
+  );
+}
+
+// ============================================================
+// CLOSE FIXED % OF ORIGINAL POSITION
+// ============================================================
+
+function closeOriginalPortion(
+  position,
+  originalFraction,
+  market,
   reason
-) {
+){
+  var targetQty =
+    position.initialQty *
+    originalFraction;
+
   var qty =
     Math.min(
       position.qty,
-      position.qty *
-      fraction
+      targetQty
     );
 
-  var gross =
-    qty *
-    px;
+  return closeExactQty(
+    position,
+    qty,
+    market,
+    reason
+  );
+}
 
-  var fee =
-    gross *
-    0.005;
+function closeAll(
+  position,
+  market,
+  reason
+){
+  return closeExactQty(
+    position,
+    position.qty,
+    market,
+    reason
+  );
+}
 
-  var proceeds =
-    gross -
-    fee;
+function closeExactQty(
+  position,
+  qty,
+  market,
+  reason
+){
+  qty =
+    Math.min(
+      qty,
+      position.qty
+    );
 
-  var basis =
-    qty *
-    position.entry;
+  if(
+    !qty ||
+    qty <= 0
+  ){
+    return;
+  }
+
+  var execution =
+    simulateSell(
+      qty,
+      market.price,
+      market.liquidity
+    );
+
+  var fractionOfOriginal =
+    position.initialQty
+      ? qty /
+        position.initialQty
+      : 1;
+
+  var allocatedCost =
+    position.totalCost *
+    fractionOfOriginal;
 
   var pnl =
-    proceeds -
-    basis;
+    execution.net -
+    allocatedCost;
 
   state.cash +=
-    proceeds;
-
-  state.fees +=
-    fee;
+    execution.net;
 
   state.realized +=
     pnl;
 
+  state.costs.dex +=
+    execution.dexFee;
+
+  state.costs.gas +=
+    execution.gas;
+
+  state.costs.slippage +=
+    execution.slippageCost;
+
   position.qty -=
     qty;
 
+  position.realizedNetProceeds +=
+    execution.net;
+
   addTrade(
     "SELL",
+
     position,
-    px,
-    gross,
+
+    market.price,
+
+    execution.executionPrice,
+
+    execution.executedGross,
+
     pnl,
+
+    execution.dexFee +
+      execution.gas +
+      execution.slippageCost,
+
     reason
   );
 
-  if (
+  if(
     position.qty <
     0.000000000001
-  ) {
+  ){
     delete state.positions[
       position.address
     ];
@@ -1742,7 +2507,11 @@ function closePosition(
   }
 }
 
-function managePositions() {
+// ============================================================
+// MANAGE POSITIONS
+// ============================================================
+
+function managePositions(){
   var strategy =
     state.strategy;
 
@@ -1751,11 +2520,11 @@ function managePositions() {
       state.positions
     );
 
-  for (
+  for(
     var i = 0;
     i < keys.length;
     i++
-  ) {
+  ){
     var position =
       state.positions[
         keys[i]
@@ -1766,7 +2535,9 @@ function managePositions() {
         position.address
       );
 
-    if (!market) {
+    if(
+      !market
+    ){
       continue;
     }
 
@@ -1780,6 +2551,7 @@ function managePositions() {
       Math.max(
         position.high ||
         position.entry,
+
         px
       );
 
@@ -1788,106 +2560,240 @@ function managePositions() {
       position.entry -
       1;
 
-    if (
-      ret <=
-      -strategy.stopLoss
-    ) {
-      closePosition(
+    // --------------------------------
+    // SELL PRESSURE
+    // --------------------------------
+
+    if(
+      market.sells5m >=
+      market.buys5m *
+      2 &&
+      market.sells5m >
+      20
+    ){
+      position.sellPressureCount +=
+        1;
+
+    }else{
+      position.sellPressureCount =
+        0;
+    }
+
+    if(
+      position.sellPressureCount >=
+      2
+    ){
+      closeAll(
         position,
-        1,
-        px,
-        "Hard stop"
+        market,
+        "Extreme sell pressure"
       );
 
       continue;
     }
 
-    if (
+    // --------------------------------
+    // LIQUIDITY COLLAPSE
+    // --------------------------------
+
+    if(
       market.liquidity <
       position.entryLiquidity *
-      0.65
-    ) {
-      closePosition(
+      0.60
+    ){
+      closeAll(
         position,
-        1,
-        px,
-        "Liquidity drop"
+        market,
+        "Liquidity drop >40%"
       );
 
       continue;
     }
 
-    if (
-      !position.tp1 &&
+    // --------------------------------
+    // BEFORE +50%
+    // --------------------------------
+
+    if(
+      !position.beActive
+    ){
+      if(
+        ret <=
+        -strategy.stopLoss
+      ){
+        closeAll(
+          position,
+          market,
+          "Initial stop"
+        );
+
+        continue;
+      }
+    }
+
+    // --------------------------------
+    // +35% → TAKE 20%
+    // --------------------------------
+
+    if(
+      !position.firstTpDone &&
       ret >=
-      strategy.tp1
-    ) {
-      closePosition(
+      strategy.firstTp
+    ){
+      closeOriginalPortion(
         position,
-        0.40,
-        px,
-        "TP1"
+        0.20,
+        market,
+        "+35% take 20%"
       );
 
-      position.tp1 =
+      position.firstTpDone =
         true;
 
       continue;
     }
 
-    if (
-      position.tp1 &&
-      !position.tp2 &&
+    // --------------------------------
+    // +50% → TAKE 20% + TRUE BE
+    // --------------------------------
+
+    if(
+      !position.beActive &&
       ret >=
-      strategy.tp2
-    ) {
-      closePosition(
+      strategy.beTrigger
+    ){
+      closeOriginalPortion(
         position,
-        0.50,
-        px,
-        "TP2"
+        0.20,
+        market,
+        "+50% take 20% / BE activated"
       );
 
-      position.tp2 =
+      position.beActive =
+        true;
+
+      position.bePrice =
+        calculateBreakEvenPrice(
+          position,
+          market
+        );
+
+      continue;
+    }
+
+    // --------------------------------
+    // +100% → TAKE 20% + RUNNER
+    // --------------------------------
+
+    if(
+      !position.runnerActive &&
+      ret >=
+      strategy.runnerTrigger
+    ){
+      closeOriginalPortion(
+        position,
+        0.20,
+        market,
+        "+100% take 20% / Runner activated"
+      );
+
+      position.runnerActive =
         true;
 
       continue;
     }
 
-    if (
-      position.tp1 &&
-      px <=
-      position.high *
-      0.90
-    ) {
-      closePosition(
-        position,
-        1,
-        px,
-        "Trailing stop"
-      );
+    // --------------------------------
+    // AFTER +50% → BE FLOOR
+    // --------------------------------
 
-      continue;
+    if(
+      position.beActive
+    ){
+      position.bePrice =
+        calculateBreakEvenPrice(
+          position,
+          market
+        );
+
+      // +50% ~ +100%
+      if(
+        !position.runnerActive &&
+        px <=
+        position.bePrice
+      ){
+        closeAll(
+          position,
+          market,
+          "Break-even stop"
+        );
+
+        continue;
+      }
     }
 
-    if (
-      !position.tp1 &&
+    // --------------------------------
+    // RUNNER MODE
+    // --------------------------------
+
+    if(
+      position.runnerActive
+    ){
+      var trailingStop =
+        position.high *
+        (
+          1 -
+          strategy.runnerTrail
+        );
+
+      var runnerStop =
+        Math.max(
+          trailingStop,
+          position.bePrice ||
+          position.entry
+        );
+
+      if(
+        px <=
+        runnerStop
+      ){
+        closeAll(
+          position,
+          market,
+          "Golden dog runner trail"
+        );
+
+        continue;
+      }
+    }
+
+    // --------------------------------
+    // TIME STOP
+    // --------------------------------
+
+    if(
+      !position.firstTpDone &&
       Date.now() -
       position.opened >
-      120 *
+      strategy.timeStopMinutes *
       60000
-    ) {
-      closePosition(
+    ){
+      closeAll(
         position,
-        1,
-        px,
-        "120m time stop"
+        market,
+        "Time stop"
       );
+
+      continue;
     }
   }
 }
 
-function enterPositions() {
+// ============================================================
+// ENTRY
+// ============================================================
+
+function enterPositions(){
   var strategy =
     state.strategy;
 
@@ -1903,6 +2809,7 @@ function enterPositions() {
   var room =
     Math.max(
       0,
+
       equity.equity *
       strategy.maxExposure -
       equity.positionValue
@@ -1911,30 +2818,35 @@ function enterPositions() {
   var candidates =
     [];
 
-  for (
+  for(
     var i = 0;
     i < universe.length;
     i++
-  ) {
+  ){
     var token =
       universe[i];
 
     var evaluation =
-      evaluate(token);
+      evaluate(
+        token
+      );
 
-    if (
+    if(
       evaluation.decision ===
       "BUY"
-    ) {
+    ){
       candidates.push({
-        token,
-        evaluation
+        token:
+          token,
+
+        evaluation:
+          evaluation
       });
     }
   }
 
   candidates.sort(
-    function (a,b) {
+    function(a,b){
       return (
         b.evaluation.score -
         a.evaluation.score
@@ -1942,15 +2854,15 @@ function enterPositions() {
     }
   );
 
-  for (
+  for(
     var c = 0;
     c < candidates.length;
     c++
-  ) {
-    if (
+  ){
+    if(
       slots <= 0 ||
       room < 50
-    ) {
+    ){
       break;
     }
 
@@ -1960,26 +2872,26 @@ function enterPositions() {
     var p =
       item.token;
 
-    if (
+    if(
       state.positions[
         p.address
       ]
-    ) {
+    ){
       continue;
     }
 
-    if (
+    if(
       Date.now() <
       (
         state.cooldowns[
           p.address
         ] || 0
       )
-    ) {
+    ){
       continue;
     }
 
-    var size =
+    var notional =
       Math.min(
         equity.equity *
         strategy.positionPct,
@@ -1988,51 +2900,67 @@ function enterPositions() {
 
         room,
 
-        state.cash /
-        1.005
+        state.cash -
+        1
       );
 
-    if (
-      size <
+    if(
+      notional <
       50
-    ) {
+    ){
       continue;
     }
 
-    var entryFee =
-      size *
-      0.005;
+    var execution =
+      simulateBuy(
+        p.price,
+        notional,
+        p.liquidity
+      );
+
+    if(
+      state.cash <
+      execution.cashCost
+    ){
+      continue;
+    }
 
     state.cash -=
-      size +
-      entryFee;
+      execution.cashCost;
 
-    state.fees +=
-      entryFee;
+    state.costs.dex +=
+      execution.dexFee;
 
-    var qty =
-      size /
-      p.price;
+    state.costs.gas +=
+      execution.gas;
 
-    state.positions[
-      p.address
-    ] = {
+    state.costs.slippage +=
+      execution.slippageCost;
+
+    var position = {
       address:
         p.address,
 
       symbol:
         p.symbol,
 
+      marketEntry:
+        p.price,
+
       entry:
-        p.price,
+        execution.executionPrice,
 
-      last:
-        p.price,
+      qty:
+        execution.qty,
 
-      high:
-        p.price,
+      initialQty:
+        execution.qty,
 
-      qty,
+      totalCost:
+        execution.cashCost,
+
+      realizedNetProceeds:
+        0,
 
       opened:
         Date.now(),
@@ -2040,35 +2968,66 @@ function enterPositions() {
       entryLiquidity:
         p.liquidity,
 
-      tp1:false,
+      high:
+        execution.executionPrice,
 
-      tp2:false,
+      last:
+        p.price,
+
+      firstTpDone:
+        false,
+
+      beActive:
+        false,
+
+      runnerActive:
+        false,
+
+      bePrice:
+        0,
+
+      sellPressureCount:
+        0,
 
       score:
         item.evaluation.score
     };
 
+    state.positions[
+      p.address
+    ] =
+      position;
+
     addTrade(
       "BUY",
 
-      state.positions[
-        p.address
-      ],
+      position,
 
       p.price,
 
-      size,
+      execution.executionPrice,
 
-      -entryFee,
+      notional,
 
-      "Score " +
+      -(
+        execution.dexFee +
+        execution.gas +
+        execution.slippageCost
+      ),
+
+      execution.dexFee +
+        execution.gas +
+        execution.slippageCost,
+
+      "Entry Score " +
       item.evaluation.score
     );
 
-    slots--;
+    slots -=
+      1;
 
     room -=
-      size;
+      notional;
   }
 }
 
@@ -2076,10 +3035,10 @@ function enterPositions() {
 // STRATEGY EVOLUTION
 // ============================================================
 
-function maybeEvolveStrategy() {
+function maybeEvolveStrategy(){
   var sells =
     state.trades.filter(
-      function (trade) {
+      function(trade){
         return (
           trade.action ===
           "SELL"
@@ -2087,33 +3046,30 @@ function maybeEvolveStrategy() {
       }
     );
 
-  if (
+  if(
     sells.length <
-    6
-  ) {
+    8
+  ){
     return;
   }
 
-  var evolution =
-    state.evolution;
-
-  if (
+  if(
     Date.now() -
-    evolution.lastTime <
+    state.evolution.lastTime <
     EVOLUTION_MS
-  ) {
+  ){
     return;
   }
 
   var newClosed =
     sells.length -
-    evolution.lastClosedCount;
+    state.evolution.lastClosedCount;
 
-  if (
-    evolution.lastTime &&
+  if(
+    state.evolution.lastTime &&
     newClosed <
     3
-  ) {
+  ){
     return;
   }
 
@@ -2125,20 +3081,16 @@ function maybeEvolveStrategy() {
 
   var wins =
     sample.filter(
-      function (trade) {
+      function(trade){
         return (
-          trade.pnl >
-          0
+          trade.pnl > 0
         );
       }
     );
 
-  var totalPnl =
+  var total =
     sample.reduce(
-      function (
-        sum,
-        trade
-      ) {
+      function(sum,trade){
         return (
           sum +
           Number(
@@ -2154,7 +3106,7 @@ function maybeEvolveStrategy() {
     sample.length;
 
   var avgPnl =
-    totalPnl /
+    total /
     sample.length;
 
   var before =
@@ -2170,13 +3122,13 @@ function maybeEvolveStrategy() {
   var reason =
     "";
 
-  if (
+  if(
     winRate <
-    0.40 ||
+      0.40 ||
     avgPnl <
-    -3
-  ) {
-    // 防守模式
+      -3
+  ){
+    // DEFENSIVE
     strategy.scoreMin =
       clamp(
         strategy.scoreMin + 2,
@@ -2193,32 +3145,37 @@ function maybeEvolveStrategy() {
 
     strategy.positionPct =
       clamp(
-        strategy.positionPct -
-        0.005,
+        strategy.positionPct - 0.005,
         0.03,
         0.06
       );
 
     strategy.stopLoss =
       clamp(
-        strategy.stopLoss -
-        0.01,
+        strategy.stopLoss - 0.01,
         0.08,
-        0.12
+        0.14
+      );
+
+    strategy.runnerTrail =
+      clamp(
+        strategy.runnerTrail - 0.02,
+        0.22,
+        0.32
       );
 
     reason =
-      "Defensive：近期勝率或平均損益偏弱";
+      "Defensive";
 
-  } else if (
+  }else if(
     winRate >=
       0.60 &&
     avgPnl >
-      2 &&
+      3 &&
     maxDrawdown() <
-      6
-  ) {
-    // 表現良好，小幅放寬
+      8
+  ){
+    // EXPANSION
     strategy.scoreMin =
       clamp(
         strategy.scoreMin - 1,
@@ -2235,37 +3192,26 @@ function maybeEvolveStrategy() {
 
     strategy.positionPct =
       clamp(
-        strategy.positionPct +
-        0.005,
+        strategy.positionPct + 0.005,
         0.03,
         0.06
       );
 
-    strategy.tp1 =
+    strategy.runnerTrail =
       clamp(
-        strategy.tp1 +
-        0.01,
-        0.12,
-        0.20
-      );
-
-    strategy.tp2 =
-      clamp(
-        strategy.tp2 +
-        0.02,
-        0.25,
-        0.40
+        strategy.runnerTrail + 0.01,
+        0.22,
+        0.32
       );
 
     reason =
-      "Expansion：近期勝率、平均損益與回撤表現良好";
+      "Expansion";
 
-  } else {
-    // 中性：只做細調
-    if (
+  }else{
+    if(
       winRate <
       0.50
-    ) {
+    ){
       strategy.scoreMin =
         clamp(
           strategy.scoreMin + 1,
@@ -2274,8 +3220,9 @@ function maybeEvolveStrategy() {
         );
 
       reason =
-        "Fine tune：勝率普通，提高進場品質";
-    } else {
+        "Quality filter";
+
+    }else{
       strategy.ratioMin =
         clamp(
           strategy.ratioMin - 0.01,
@@ -2284,17 +3231,17 @@ function maybeEvolveStrategy() {
         );
 
       reason =
-        "Fine tune：表現穩定，微幅放寬買壓條件";
+        "Fine tune";
     }
   }
 
-  evolution.lastTime =
+  state.evolution.lastTime =
     Date.now();
 
-  evolution.lastClosedCount =
+  state.evolution.lastClosedCount =
     sells.length;
 
-  evolution.history.unshift({
+  state.evolution.history.unshift({
     time:
       Date.now(),
 
@@ -2307,9 +3254,11 @@ function maybeEvolveStrategy() {
     avgPnl:
       avgPnl,
 
-    reason,
+    reason:
+      reason,
 
-    before,
+    before:
+      before,
 
     after:
       JSON.parse(
@@ -2319,8 +3268,8 @@ function maybeEvolveStrategy() {
       )
   });
 
-  evolution.history =
-    evolution.history.slice(
+  state.evolution.history =
+    state.evolution.history.slice(
       0,
       30
     );
@@ -2329,10 +3278,10 @@ function maybeEvolveStrategy() {
 }
 
 // ============================================================
-// EQUITY
+// EQUITY / DD
 // ============================================================
 
-function recordEquity() {
+function recordEquity(){
   var value =
     getEquity()
       .equity;
@@ -2342,11 +3291,10 @@ function recordEquity() {
 
   var last =
     history[
-      history.length -
-      1
+      history.length - 1
     ];
 
-  if (
+  if(
     !last ||
     Math.abs(
       last.equity -
@@ -2356,7 +3304,7 @@ function recordEquity() {
     Date.now() -
     last.time >
     300000
-  ) {
+  ){
     history.push({
       time:
         Date.now(),
@@ -2366,10 +3314,10 @@ function recordEquity() {
     });
   }
 
-  if (
+  if(
     history.length >
     2000
-  ) {
+  ){
     state.equityHistory =
       history.slice(
         -2000
@@ -2377,19 +3325,19 @@ function recordEquity() {
   }
 }
 
-function maxDrawdown() {
+function maxDrawdown(){
   var peak =
     0;
 
   var maximum =
     0;
 
-  for (
+  for(
     var i = 0;
     i <
     state.equityHistory.length;
     i++
-  ) {
+  ){
     var value =
       state.equityHistory[
         i
@@ -2401,10 +3349,11 @@ function maxDrawdown() {
         value
       );
 
-    if (peak) {
+    if(peak){
       maximum =
         Math.max(
           maximum,
+
           (
             peak -
             value
@@ -2424,8 +3373,8 @@ function maxDrawdown() {
 // SCAN
 // ============================================================
 
-async function scan() {
-  if (scanning) {
+async function scan(){
+  if(scanning){
     return;
   }
 
@@ -2458,19 +3407,19 @@ async function scan() {
   warningBox.style.display =
     "none";
 
-  try {
+  try{
     var positionAddresses =
       Object.keys(
         state.positions
       );
 
-    var requestUrl =
+    var request =
       "/api/market";
 
-    if (
+    if(
       positionAddresses.length
-    ) {
-      requestUrl +=
+    ){
+      request +=
         "?positions=" +
         encodeURIComponent(
           positionAddresses.join(
@@ -2479,25 +3428,27 @@ async function scan() {
         );
     }
 
+    request +=
+      (
+        request.indexOf("?") === -1
+          ? "?"
+          : "&"
+      ) +
+      "t=" +
+      Date.now();
+
     var response =
       await fetch(
-        requestUrl +
-        (
-          requestUrl.indexOf(
-            "?"
-          ) === -1
-            ? "?"
-            : "&"
-        ) +
-        "t=" +
-        Date.now(),
-
+        request,
         {
-          cache:"no-store"
+          cache:
+            "no-store"
         }
       );
 
-    if (!response.ok) {
+    if(
+      !response.ok
+    ){
       var text =
         await response.text();
 
@@ -2512,12 +3463,12 @@ async function scan() {
     var result =
       await response.json();
 
-    if (
+    if(
       !result ||
       !Array.isArray(
         result.tokens
       )
-    ) {
+    ){
       throw new Error(
         "Invalid market response"
       );
@@ -2526,11 +3477,11 @@ async function scan() {
     universe =
       result.tokens;
 
-    if (
+    if(
       result.stale
-    ) {
+    ){
       warningBox.textContent =
-        "本輪 discovery 失敗，暫時沿用上一批成功市場資料；持倉幣仍會另外刷新價格。";
+        "Discovery 暫時失敗，目前沿用上一批市場資料；持倉價格仍會獨立更新。";
 
       warningBox.style.display =
         "block";
@@ -2555,7 +3506,7 @@ async function scan() {
       new Date()
         .toLocaleTimeString();
 
-  } catch (error) {
+  }catch(error){
     console.error(
       error
     );
@@ -2567,7 +3518,7 @@ async function scan() {
     errorBox.style.display =
       "block";
 
-  } finally {
+  }finally{
     scanning =
       false;
 
@@ -2591,11 +3542,11 @@ async function scan() {
 // RENDER
 // ============================================================
 
-function render() {
+function render(){
   var equity =
     getEquity();
 
-  var total =
+  var totalPnl =
     equity.equity -
     START_BALANCE;
 
@@ -2615,23 +3566,27 @@ function render() {
     ) +
     " U";
 
-  var totalElement =
+  var total =
     byId(
       "totalPnl"
     );
 
-  totalElement.textContent =
+  total.textContent =
     (
-      total >= 0
+      totalPnl >= 0
         ? "+"
         : ""
     ) +
-    money(total) +
+    money(
+      totalPnl
+    ) +
     " U";
 
-  totalElement.className =
+  total.className =
     "value " +
-    color(total);
+    color(
+      totalPnl
+    );
 
   var realized =
     byId(
@@ -2679,7 +3634,7 @@ function render() {
 
   var sellTrades =
     state.trades.filter(
-      function (trade) {
+      function(trade){
         return (
           trade.action ===
           "SELL"
@@ -2689,7 +3644,7 @@ function render() {
 
   var wins =
     sellTrades.filter(
-      function (trade) {
+      function(trade){
         return (
           trade.pnl > 0
         );
@@ -2722,13 +3677,77 @@ function render() {
       state.positions
     ).length;
 
+  // ---------------------------------
+  // COSTS
+  // ---------------------------------
+
+  var costs =
+    totalCosts();
+
+  byId(
+    "dexFees"
+  ).textContent =
+    money(
+      state.costs.dex
+    ) +
+    " U";
+
+  byId(
+    "slippageCosts"
+  ).textContent =
+    money(
+      state.costs.slippage
+    ) +
+    " U";
+
+  byId(
+    "gasCosts"
+  ).textContent =
+    money(
+      state.costs.gas
+    ) +
+    " U";
+
+  byId(
+    "allCosts"
+  ).textContent =
+    money(
+      costs
+    ) +
+    " U";
+
+  byId(
+    "totalCosts"
+  ).textContent =
+    money(
+      costs
+    ) +
+    " U";
+
+  byId(
+    "exposure"
+  ).textContent =
+    (
+      equity.positionValue /
+      Math.max(
+        equity.equity,
+        1
+      ) *
+      100
+    ).toFixed(1) +
+    "%";
+
   var evaluations =
     universe.map(
-      function (token) {
+      function(token){
         return {
-          token,
+          token:
+            token,
+
           evaluation:
-            evaluate(token)
+            evaluate(
+              token
+            )
         };
       }
     );
@@ -2741,7 +3760,7 @@ function render() {
 
   var candidates =
     evaluations.filter(
-      function (item) {
+      function(item){
         return (
           item.evaluation
             .decision ===
@@ -2755,18 +3774,19 @@ function render() {
   ).textContent =
     candidates.length;
 
-  var bestScore =
+  var best =
     0;
 
-  for (
+  for(
     var i = 0;
     i <
     evaluations.length;
     i++
-  ) {
-    bestScore =
+  ){
+    best =
       Math.max(
-        bestScore,
+        best,
+
         evaluations[i]
           .evaluation
           .score
@@ -2777,7 +3797,7 @@ function render() {
     "bestScore"
   ).textContent =
     evaluations.length
-      ? bestScore
+      ? best
       : "—";
 
   byId(
@@ -2786,85 +3806,30 @@ function render() {
     state.trades.length;
 
   byId(
-    "fees"
-  ).textContent =
-    money(
-      state.fees
-    ) +
-    " U";
-
-  byId(
-    "exposure"
-  ).textContent =
-    (
-      equity.positionValue /
-      Math.max(
-        1,
-        equity.equity
-      ) *
-      100
-    ).toFixed(1) +
-    "%";
-
-  // strategy display
-  var strategy =
-    state.strategy;
-
-  byId(
-    "strategyScore"
-  ).textContent =
-    strategy.scoreMin;
-
-  byId(
-    "strategyRatio"
-  ).textContent =
-    strategy.ratioMin
-      .toFixed(2);
-
-  byId(
-    "strategySize"
-  ).textContent =
-    (
-      strategy.positionPct *
-      100
-    ).toFixed(1) +
-    "%";
-
-  byId(
     "strategySl"
   ).textContent =
     "-" +
     (
-      strategy.stopLoss *
+      state.strategy.stopLoss *
       100
     ).toFixed(0) +
     "%";
 
   byId(
-    "strategyTp1"
+    "strategyTrail"
   ).textContent =
-    "+" +
     (
-      strategy.tp1 *
+      state.strategy.runnerTrail *
       100
     ).toFixed(0) +
-    "%";
+    "% Trail";
 
-  byId(
-    "strategyTp2"
-  ).textContent =
-    "+" +
-    (
-      strategy.tp2 *
-      100
-    ).toFixed(0) +
-    "%";
+  // ---------------------------------
+  // FEED
+  // ---------------------------------
 
-  renderEvolution();
-
-  // feed
   evaluations.sort(
-    function (a,b) {
+    function(a,b){
       return (
         b.evaluation.score -
         a.evaluation.score
@@ -2875,7 +3840,7 @@ function render() {
   var feedRows =
     [];
 
-  for (
+  for(
     var f = 0;
     f <
     Math.min(
@@ -2883,7 +3848,7 @@ function render() {
       50
     );
     f++
-  ) {
+  ){
     var item =
       evaluations[f];
 
@@ -2893,8 +3858,9 @@ function render() {
     var e =
       item.evaluation;
 
-    var className =
-      e.decision === "BUY"
+    var decisionClass =
+      e.decision ===
+      "BUY"
         ? "green"
         : (
             e.decision ===
@@ -2902,6 +3868,13 @@ function render() {
               ? "red"
               : "yellow"
           );
+
+    var ratio =
+      p.buys5m /
+      Math.max(
+        1,
+        p.sells5m
+      );
 
     feedRows.push(
       "<tr>" +
@@ -2917,7 +3890,7 @@ function render() {
       "</td>" +
 
       "<td>" +
-      age(
+      ageFromTimestamp(
         p.createdAt
       ) +
       "</td>" +
@@ -2950,9 +3923,7 @@ function render() {
       "k</td>" +
 
       "<td>" +
-      p.buys5m +
-      "/" +
-      p.sells5m +
+      ratio.toFixed(2) +
       "</td>" +
 
       '<td class="' +
@@ -2976,7 +3947,7 @@ function render() {
       "</b></td>" +
 
       '<td class="' +
-      className +
+      decisionClass +
       '">' +
       e.decision +
       "</td>" +
@@ -2992,12 +3963,15 @@ function render() {
     (
       "<tr>" +
       '<td colspan="11">' +
-      "尚未取得市場資料" +
+      "尚未取得行情" +
       "</td>" +
       "</tr>"
     );
 
-  // positions
+  // ---------------------------------
+  // POSITIONS
+  // ---------------------------------
+
   var positionRows =
     [];
 
@@ -3006,34 +3980,108 @@ function render() {
       state.positions
     );
 
-  for (
-    var pIndex = 0;
-    pIndex <
+  for(
+    var x = 0;
+    x <
     positionKeys.length;
-    pIndex++
-  ) {
+    x++
+  ){
     var position =
       state.positions[
-        positionKeys[
-          pIndex
-        ]
+        positionKeys[x]
       ];
 
-    var px =
-      currentPrice(
+    var market =
+      findToken(
         position.address
-      ) ||
-      position.last ||
-      position.entry;
+      );
 
-    var value =
+    var px =
+      market
+        ? market.price
+        : (
+            position.last ||
+            position.entry
+          );
+
+    var rawValue =
       position.qty *
       px;
 
+    var remainingRatio =
+      position.initialQty
+        ? position.qty /
+          position.initialQty
+        : 1;
+
+    var remainingCost =
+      position.totalCost *
+      remainingRatio;
+
     var pnl =
-      value -
-      position.qty *
-      position.entry;
+      rawValue -
+      remainingCost;
+
+    var highReturn =
+      position.entry
+        ? (
+            position.high /
+            position.entry -
+            1
+          ) *
+          100
+        : 0;
+
+    var stopText =
+      "-";
+
+    var mode =
+      "NORMAL";
+
+    if(
+      position.runnerActive
+    ){
+      mode =
+        "RUNNER";
+
+      var runnerStop =
+        Math.max(
+          position.bePrice ||
+          position.entry,
+
+          position.high *
+          (
+            1 -
+            state.strategy.runnerTrail
+          )
+        );
+
+      stopText =
+        formatPrice(
+          runnerStop
+        );
+
+    }else if(
+      position.beActive
+    ){
+      mode =
+        "BE";
+
+      stopText =
+        formatPrice(
+          position.bePrice
+        );
+
+    }else{
+      stopText =
+        formatPrice(
+          position.entry *
+          (
+            1 -
+            state.strategy.stopLoss
+          )
+        );
+    }
 
     positionRows.push(
       "<tr>" +
@@ -3055,24 +4103,36 @@ function render() {
       "</td>" +
 
       "<td>" +
-      money(value) +
+      money(
+        rawValue
+      ) +
       " U</td>" +
 
       '<td class="' +
-      color(pnl) +
+      color(
+        pnl
+      ) +
       '">' +
       (
         pnl >= 0
           ? "+"
           : ""
       ) +
-      money(pnl) +
+      money(
+        pnl
+      ) +
       " U</td>" +
 
+      "<td>+" +
+      highReturn.toFixed(1) +
+      "%</td>" +
+
       "<td>" +
-      age(
-        position.opened
-      ) +
+      stopText +
+      "</td>" +
+
+      "<td>" +
+      mode +
       "</td>" +
 
       "</tr>"
@@ -3085,17 +4145,20 @@ function render() {
     positionRows.join("") ||
     (
       "<tr>" +
-      '<td colspan="6">' +
+      '<td colspan="8">' +
       "目前沒有持倉" +
       "</td>" +
       "</tr>"
     );
 
-  // trades
+  // ---------------------------------
+  // TRADES
+  // ---------------------------------
+
   var tradeRows =
     [];
 
-  for (
+  for(
     var t = 0;
     t <
     Math.min(
@@ -3103,9 +4166,20 @@ function render() {
       100
     );
     t++
-  ) {
+  ){
     var trade =
       state.trades[t];
+
+    // migration for old log
+    var marketPrice =
+      trade.marketPrice ||
+      trade.price ||
+      0;
+
+    var executionPrice =
+      trade.executionPrice ||
+      trade.price ||
+      0;
 
     tradeRows.push(
       "<tr>" +
@@ -3126,7 +4200,13 @@ function render() {
 
       "<td>" +
       formatPrice(
-        trade.price
+        marketPrice
+      ) +
+      "</td>" +
+
+      "<td>" +
+      formatPrice(
+        executionPrice
       ) +
       "</td>" +
 
@@ -3152,6 +4232,13 @@ function render() {
       " U</td>" +
 
       "<td>" +
+      money(
+        trade.costs ||
+        0
+      ) +
+      " U</td>" +
+
+      "<td>" +
       trade.reason +
       "</td>" +
 
@@ -3165,26 +4252,80 @@ function render() {
     tradeRows.join("") ||
     (
       "<tr>" +
-      '<td colspan="7">' +
+      '<td colspan="9">' +
       "尚無交易" +
       "</td>" +
       "</tr>"
     );
 
+  renderEvolution();
+
   drawChart();
 }
 
-function renderEvolution() {
-  var history =
-    state.evolution
-      .history;
+function ageFromTimestamp(timestamp){
+  var seconds =
+    Math.max(
+      0,
 
-  if (!history.length) {
+      (
+        Date.now() -
+        timestamp
+      ) /
+      1000
+    );
+
+  if(
+    seconds <
+    3600
+  ){
+    return (
+      Math.floor(
+        seconds /
+        60
+      ) +
+      "m"
+    );
+  }
+
+  if(
+    seconds <
+    86400
+  ){
+    return (
+      (
+        seconds /
+        3600
+      ).toFixed(1) +
+      "h"
+    );
+  }
+
+  return (
+    (
+      seconds /
+      86400
+    ).toFixed(1) +
+    "d"
+  );
+}
+
+// ============================================================
+// EVOLUTION DISPLAY
+// ============================================================
+
+function renderEvolution(){
+  var history =
+    state.evolution.history;
+
+  if(
+    !history.length
+  ){
     byId(
       "evolutionLog"
     ).innerHTML =
       '<div class="evolution-entry">' +
-      "尚未調整。至少需要 6 筆出場紀錄後才會開始學習。" +
+      "等待至少 8 筆 SELL 紀錄後開始自動調參。" +
       "</div>";
 
     return;
@@ -3193,7 +4334,7 @@ function renderEvolution() {
   var rows =
     [];
 
-  for (
+  for(
     var i = 0;
     i <
     Math.min(
@@ -3201,8 +4342,8 @@ function renderEvolution() {
       5
     );
     i++
-  ) {
-    var item =
+  ){
+    var e =
       history[i];
 
     rows.push(
@@ -3210,45 +4351,45 @@ function renderEvolution() {
 
       "<b>" +
       new Date(
-        item.time
+        e.time
       ).toLocaleString() +
       "</b><br>" +
 
-      "最近 " +
-      item.sample +
-      " 筆出場｜勝率 " +
+      e.reason +
+
+      "｜Win " +
       (
-        item.winRate *
+        e.winRate *
         100
       ).toFixed(1) +
-      "%｜平均 PnL " +
-      money(
-        item.avgPnl
-      ) +
-      "U<br>" +
+      "%" +
 
-      item.reason +
+      "｜Avg " +
+      money(
+        e.avgPnl
+      ) +
+      "U" +
 
       "<br>Score " +
-      item.before.scoreMin +
+      e.before.scoreMin +
       " → " +
-      item.after.scoreMin +
+      e.after.scoreMin +
 
       "｜B/S " +
-      item.before.ratioMin
+      e.before.ratioMin
         .toFixed(2) +
       " → " +
-      item.after.ratioMin
+      e.after.ratioMin
         .toFixed(2) +
 
       "｜Size " +
       (
-        item.before.positionPct *
+        e.before.positionPct *
         100
       ).toFixed(1) +
       "% → " +
       (
-        item.after.positionPct *
+        e.after.positionPct *
         100
       ).toFixed(1) +
       "%" +
@@ -3263,7 +4404,11 @@ function renderEvolution() {
     rows.join("");
 }
 
-function drawChart() {
+// ============================================================
+// CHART
+// ============================================================
+
+function drawChart(){
   var canvas =
     byId(
       "equityChart"
@@ -3290,13 +4435,15 @@ function drawChart() {
   var data =
     state.equityHistory;
 
-  if (!data.length) {
+  if(
+    !data.length
+  ){
     return;
   }
 
   var values =
     data.map(
-      function (item) {
+      function(item){
         return (
           item.equity
         );
@@ -3315,11 +4462,11 @@ function drawChart() {
       values
     );
 
-  if (
+  if(
     maximum -
     minimum <
     1
-  ) {
+  ){
     minimum -= 10;
     maximum += 10;
   }
@@ -3332,11 +4479,11 @@ function drawChart() {
 
   context.beginPath();
 
-  for (
+  for(
     var i = 0;
     i < data.length;
     i++
-  ) {
+  ){
     var x =
       10 +
       (
@@ -3347,8 +4494,7 @@ function drawChart() {
         i /
         Math.max(
           1,
-          data.length -
-          1
+          data.length - 1
         )
       );
 
@@ -3370,12 +4516,15 @@ function drawChart() {
         )
       );
 
-    if (i === 0) {
+    if(
+      i === 0
+    ){
       context.moveTo(
         x,
         y
       );
-    } else {
+
+    }else{
       context.lineTo(
         x,
         y
@@ -3386,12 +4535,16 @@ function drawChart() {
   context.stroke();
 }
 
-function resetAccount() {
-  if (
+// ============================================================
+// RESET
+// ============================================================
+
+function resetAccount(){
+  if(
     !confirm(
-      "確定清除交易、績效與 Strategy Evolution，重新從 10,000U 開始？"
+      "確定清除所有模擬交易與策略資料，重新從 10,000U 開始？"
     )
-  ) {
+  ){
     return;
   }
 
@@ -3402,6 +4555,10 @@ function resetAccount() {
 
   render();
 }
+
+// ============================================================
+// EVENTS
+// ============================================================
 
 byId(
   "scanBtn"
@@ -3418,10 +4575,12 @@ byId(
 );
 
 setInterval(
-  function () {
-    var seconds =
+  function(){
+
+    var remaining =
       Math.max(
         0,
+
         Math.ceil(
           (
             nextScanAt -
@@ -3434,19 +4593,22 @@ setInterval(
     byId(
       "nextScan"
     ).textContent =
-      seconds +
+      remaining +
       "s";
 
-    if (
+    if(
       !scanning &&
       Date.now() >=
       nextScanAt
-    ) {
+    ){
       scan();
     }
+
   },
   1000
 );
+
+save();
 
 render();
 
@@ -3469,21 +4631,21 @@ setTimeout(
 
 const server =
   http.createServer(
-    async function (
+    async function(
       req,
       res
-    ) {
-      try {
+    ){
+      try{
         const url =
           new URL(
             req.url,
             "http://localhost"
           );
 
-        if (
+        if(
           url.pathname ===
           "/health"
-        ) {
+        ){
           res.writeHead(
             200,
             {
@@ -3499,25 +4661,31 @@ const server =
           );
         }
 
-        if (
+        if(
           url.pathname ===
           "/api/market"
-        ) {
-          try {
-            const positionsRaw =
+        ){
+          try{
+            const raw =
               url.searchParams.get(
                 "positions"
               ) || "";
 
             const positions =
-              positionsRaw
+              raw
                 .split(",")
                 .map(
-                  item =>
-                    item.trim()
+                  function(item){
+                    return (
+                      item.trim()
+                    );
+                  }
                 )
                 .filter(Boolean)
-                .slice(0, 20);
+                .slice(
+                  0,
+                  20
+                );
 
             const data =
               await getMarketData(
@@ -3544,7 +4712,7 @@ const server =
               )
             );
 
-          } catch (error) {
+          }catch(error){
             console.error(
               "Market API error:",
               error
@@ -3586,8 +4754,10 @@ const server =
           PAGE
         );
 
-      } catch (error) {
-        console.error(error);
+      }catch(error){
+        console.error(
+          error
+        );
 
         res.writeHead(
           500,
@@ -3607,9 +4777,9 @@ const server =
 server.listen(
   PORT,
   "0.0.0.0",
-  function () {
+  function(){
     console.log(
-      "MemeHunter Evolution running on port",
+      "MemeHunter Golden Dog running on port",
       PORT
     );
   }
